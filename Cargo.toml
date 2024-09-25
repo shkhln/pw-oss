@@ -1,0 +1,13 @@
+[package]
+name = "spa-freebsd-oss"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc         = "0.2.159"
+libspa       = { git = 'https://gitlab.freedesktop.org/pipewire/pipewire-rs.git', rev = '016e554768ae251c8de3724ea4b06f4749a8dd00' }
+nix          = { version = "0.27.1", features = ["ioctl"] } # same version as in libspa's dependencies
+regex        = "1.10.6"
