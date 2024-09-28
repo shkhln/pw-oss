@@ -51,16 +51,6 @@ pub unsafe fn node_emit_result(hooks: &mut spa_hook_list, seq: c_int, res: c_int
   });
 }
 
-pub unsafe fn spa_loop_invoke(loop_: *const spa_loop, func: spa_invoke_func_t,
-  seq: u32, data: *const c_void, size: usize, block: bool, user_data: *mut c_void) -> c_int
-{
-  let loop_methods = (*loop_).iface.cb.funcs.cast::<spa_loop_methods>().as_ref()
-    .expect("loop should be initialized");
-  assert!(loop_methods.version >= SPA_VERSION_LOOP_METHODS);
-  let spa_loop_invoke = loop_methods.invoke.expect("invoke should be initialized");
-  spa_loop_invoke((*loop_).iface.cb.data, func, seq, data, size, block, user_data)
-}
-
 pub unsafe fn for_each_dict_item(dict: &spa_dict, mut apply: impl FnMut(&str, &str)) {
   for item in std::slice::from_raw_parts(dict.items, dict.n_items as usize) {
     let key   = CStr::from_ptr(item.key)  .to_str().unwrap();
@@ -347,5 +337,73 @@ impl PortInfo {
     let old = self.info.change_mask;
     self.info.change_mask = new_mask;
     old
+  }
+}
+
+pub struct Loop {
+  loop_:   &'static spa_loop,        // not really 'static, but it should outlive our plugin anyway
+  methods: &'static spa_loop_methods // ditto
+}
+
+impl Loop {
+
+  pub unsafe fn wrap(loop_: *mut spa_loop) -> Self {
+    let loop_  = loop_.cast::<spa_loop>().as_ref()
+      .expect("loop should be initialized");
+    let methods = loop_.iface.cb.funcs.cast::<spa_loop_methods>().as_ref()
+      .expect("loop methods should be initialized");
+    assert!(methods.version >= SPA_VERSION_LOOP_METHODS);
+    Self { loop_, methods }
+  }
+
+  pub unsafe extern "C" fn add_source(&self, source: *mut spa_source) -> c_int {
+    let spa_loop_add_source = self.methods.add_source.expect("add_source should be initialized");
+    spa_loop_add_source(self.loop_.iface.cb.data, source)
+  }
+
+  pub unsafe extern "C" fn invoke(&self,
+    func: spa_invoke_func_t, seq: u32, data: *const c_void, size: usize, block: bool, user_data: *mut c_void) -> c_int
+  {
+    let spa_loop_invoke = self.methods.invoke.expect("invoke should be initialized");
+    spa_loop_invoke(self.loop_.iface.cb.data, func, seq, data, size, block, user_data)
+  }
+}
+
+pub struct System {
+  system:  &'static spa_system,        // not really 'static, but it should outlive our plugin anyway
+  methods: &'static spa_system_methods // ditto
+}
+
+impl System {
+
+  pub unsafe fn wrap(system: *mut spa_system) -> Self {
+    let system  = system.cast::<spa_system>().as_ref()
+      .expect("system should be initialized");
+    let methods = system.iface.cb.funcs.cast::<spa_system_methods>().as_ref()
+      .expect("system methods should be initialized");
+    assert!(methods.version >= SPA_VERSION_SYSTEM_METHODS);
+    Self { system, methods }
+  }
+
+  pub unsafe extern "C" fn clock_gettime(&self, clock_id: c_int, value: *mut timespec) -> c_int {
+    let spa_system_clock_gettime = self.methods.clock_gettime.expect("clock_gettime should be initialized");
+    spa_system_clock_gettime(self.system.iface.cb.data, clock_id, value)
+  }
+
+  pub unsafe extern "C" fn timerfd_create(&self, clock_id: c_int, flags: c_int) -> c_int {
+    let spa_system_timerfd_create = self.methods.timerfd_create.expect("timerfd_create should be assigned");
+    spa_system_timerfd_create(self.system.iface.cb.data, clock_id, flags)
+  }
+
+  pub unsafe extern "C" fn timerfd_read(&self, fd: c_int, expirations: *mut u64) -> c_int {
+    let spa_system_timerfd_read = self.methods.timerfd_read.expect("timerfd_read should be initialized");
+    spa_system_timerfd_read(self.system.iface.cb.data, fd, expirations)
+  }
+
+  pub unsafe extern "C" fn timerfd_settime(&self,
+    fd: c_int, flags: c_int, new_value: *const itimerspec, old_value: *mut itimerspec) -> c_int
+  {
+    let spa_system_timerfd_settime = self.methods.timerfd_settime.expect("timerfd_settime should be initialized");
+    spa_system_timerfd_settime(self.system.iface.cb.data, fd, flags, new_value, old_value)
   }
 }

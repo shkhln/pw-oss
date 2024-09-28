@@ -12,8 +12,8 @@ struct State {
   node:         spa_node,
   node_info:    crate::spa::NodeInfo,
   port_info:    crate::spa::PortInfo,
-  data_loop:    *mut spa_loop,
-  data_system:  *mut spa_system,
+  data_loop:    crate::spa::Loop,
+  data_system:  crate::spa::System,
   clock:        *mut spa_io_clock,
   position:     *mut spa_io_position,
   timer_source: spa_source,
@@ -175,14 +175,8 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
 
-  let system_methods = (*state.data_system).iface.cb.funcs.cast::<spa_system_methods>().as_ref()
-    .expect("data_system should be initialized");
-  assert!(system_methods.version >= SPA_VERSION_SYSTEM_METHODS);
-
-  let spa_system_timerfd_read = system_methods.timerfd_read.expect("timerfd_read should be initialized");
-
   let mut expirations = 0;
-  let err = spa_system_timerfd_read(state.data_system.cast(), state.timer_source.fd, &mut expirations);
+  let err = state.data_system.timerfd_read(state.timer_source.fd, &mut expirations);
   assert_ne!(err, -1);
 
   let nsec = state.next_time;
@@ -231,14 +225,7 @@ unsafe fn set_timeout(state: &mut State, next_time: u64) {
     it_interval: timespec { tv_sec: 0, tv_nsec: 0 }
   };
 
-  let f = (*state.data_system).iface.cb.funcs.cast::<spa_system_methods>().as_ref()
-    .expect("data_system should be initialized");
-  assert!(f.version >= SPA_VERSION_SYSTEM_METHODS);
-
-  let spa_system_timerfd_settime = f.timerfd_settime.expect("timerfd_settime should be initialized");
-
-  spa_system_timerfd_settime((*state.data_system).iface.cb.data,
-    state.timer_source.fd, SPA_FD_TIMER_ABSTIME as i32, &timerspec, std::ptr::null_mut());
+  state.data_system.timerfd_settime(state.timer_source.fd, SPA_FD_TIMER_ABSTIME as i32, &timerspec, std::ptr::null_mut());
 }
 
 #[allow(unused_variables)]
@@ -250,14 +237,8 @@ unsafe extern "C" fn set_timers(loop_: *mut spa_loop, async_: bool, seq: u32, da
   let state = user_data.cast::<State>().as_mut()
     .expect("user_data is not supposed to be null");
 
-  let f = (*state.data_system).iface.cb.funcs.cast::<spa_system_methods>().as_ref()
-    .expect("data_system should be initialized");
-  assert!(f.version >= SPA_VERSION_SYSTEM_METHODS);
-
-  let spa_system_clock_gettime = f.clock_gettime.expect("clock_gettime should be initialized");
-
   let mut now = timespec { tv_sec: 0, tv_nsec: 0 };
-  let err = spa_system_clock_gettime((*state.data_system).iface.cb.data, libc::CLOCK_MONOTONIC, &mut now);
+  let err = state.data_system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
   assert!(err >= 0);
 
   state.next_time = (now.tv_sec * SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64;
@@ -297,7 +278,8 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
     if state.following != following {
       state.following = following;
       //TODO: do we just ignore the result of this function?
-      let _ = crate::spa::spa_loop_invoke(state.data_loop, Some(set_timers), 0, std::ptr::null(), 0, true, state as *mut _ as *mut c_void);
+      let user_data = state as *mut _ as *mut c_void;
+      let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
     }
   }
 
@@ -336,7 +318,8 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
 
       state.started   = true;
       state.following = state.node_is_follower();
-      let _ = crate::spa::spa_loop_invoke(state.data_loop, Some(set_timers), 0, std::ptr::null(), 0, true, state as *mut _ as *mut c_void);
+      let user_data = state as *mut _ as *mut c_void;
+      let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend | SPA_NODE_COMMAND_Pause) => {
@@ -346,7 +329,8 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
         }
       }
       state.started = false;
-      let _ = crate::spa::spa_loop_invoke(state.data_loop, Some(set_timers), 0, std::ptr::null(), 0, true, state as *mut _ as *mut c_void);
+      let user_data = state as *mut _ as *mut c_void;
+      let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
       0
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamBegin | SPA_NODE_COMMAND_ParamEnd) => 0, // we don't care
@@ -734,18 +718,10 @@ unsafe extern "C" fn init(
     return -libc::EINVAL;
   }
 
-  let system_methods = (*data_system).iface.cb.funcs.cast::<spa_system_methods>().as_ref()
-    .expect("data_system should be initialized");
-  assert!(system_methods.version >= SPA_VERSION_SYSTEM_METHODS);
+  let data_loop   = crate::spa::Loop  ::wrap(data_loop);
+  let data_system = crate::spa::System::wrap(data_system);
 
-  let loop_methods = (*data_loop).iface.cb.funcs.cast::<spa_loop_methods>().as_ref()
-    .expect("data_loop should be initialized");
-  assert!(loop_methods.version >= SPA_VERSION_LOOP_METHODS);
-
-  let spa_system_timerfd_create = system_methods.timerfd_create.expect("timerfd_create should be assigned");
-  let spa_loop_add_source       = loop_methods.add_source.expect("add_source should be initialized");
-
-  let timer_fd = spa_system_timerfd_create((*data_system).iface.cb.data, libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32);
+  let timer_fd = data_system.timerfd_create(libc::CLOCK_MONOTONIC, (SPA_FD_CLOEXEC | SPA_FD_NONBLOCK) as i32);
   assert!(timer_fd >= 0);
 
   let mut dsp_path = None;
@@ -853,7 +829,7 @@ unsafe extern "C" fn init(
 
   spa_hook_list_init(&mut state.hooks);
 
-  let err = spa_loop_add_source((*state.data_loop).iface.cb.data, &mut state.timer_source);
+  let err = state.data_loop.add_source(&mut state.timer_source);
   assert!(err >= 0);
 
   0
