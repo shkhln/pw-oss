@@ -47,17 +47,34 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
 
       dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
 
-      let obj_info = spa_device_object_info {
-        version:      SPA_VERSION_DEVICE_OBJECT_INFO,
-        type_:        SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
-        factory_name: c"freebsd-oss.sink".as_ptr(),
-        change_mask:  crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
-        flags:        0,
-        props:        dict.raw()
-      };
+      if device.play {
+        let obj_info = spa_device_object_info {
+          version:      SPA_VERSION_DEVICE_OBJECT_INFO,
+          type_:        SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
+          factory_name: c"freebsd-oss.sink".as_ptr(),
+          change_mask:  crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
+          flags:        0,
+          props:        dict.raw()
+        };
 
-      if let Some(obj_info_fun) = f.object_info {
-        obj_info_fun(entry.cb.data, device.index, &obj_info);
+        if let Some(obj_info_fun) = f.object_info {
+          obj_info_fun(entry.cb.data, device.index * 2, &obj_info);
+        }
+      }
+
+      if device.rec {
+        let obj_info = spa_device_object_info {
+          version:      SPA_VERSION_DEVICE_OBJECT_INFO,
+          type_:        SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
+          factory_name: c"freebsd-oss.source".as_ptr(),
+          change_mask:  crate::spa::SPA_DEVICE_OBJECT_CHANGE_MASK_ALL as u64,
+          flags:        0,
+          props:        dict.raw()
+        };
+
+        if let Some(obj_info_fun) = f.object_info {
+          obj_info_fun(entry.cb.data, device.index * 2 + 1, &obj_info);
+        }
       }
     }
   });

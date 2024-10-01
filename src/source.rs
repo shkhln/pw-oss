@@ -8,21 +8,22 @@ const MAX_PORTS: usize = 1;
 
 #[repr(C)]
 struct State {
-  handle:       spa_handle,
-  node:         spa_node,
-  node_info:    crate::spa::NodeInfo,
-  port_info:    crate::spa::PortInfo,
-  data_loop:    crate::spa::Loop,
-  data_system:  crate::spa::System,
-  clock:        *mut spa_io_clock,
-  position:     *mut spa_io_position,
-  timer_source: spa_source,
-  next_time:    u64,
-  hooks:        spa_hook_list,
-  callbacks:    spa_callbacks,
-  ports:        [Port; MAX_PORTS],
-  started:      bool,
-  following:    bool
+  handle:         spa_handle,
+  node:           spa_node,
+  node_info:      crate::spa::NodeInfo,
+  port_info:      crate::spa::PortInfo,
+  data_loop:      crate::spa::Loop,
+  data_system:    crate::spa::System,
+  clock:          *mut spa_io_clock,
+  position:       *mut spa_io_position,
+  timer_source:   spa_source,
+  next_time:      u64,
+  hooks:          spa_hook_list,
+  callbacks:      spa_callbacks,
+  ports:          [Port; MAX_PORTS],
+  started:        bool,
+  following:      bool,
+  active_buffers: usize
 }
 
 impl State {
@@ -43,7 +44,8 @@ pub struct PortConfig {
   pub format:    libspa::param::audio::AudioFormat,
   pub rate:      u32,
   pub channels:  u32,
-  pub positions: Vec<u32>
+  pub positions: Vec<u32>,
+  pub stride:    u32
 }
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
@@ -70,7 +72,7 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
 
     if let Some(port_info_fun) = f.port_info {
       let old_mask = state.port_info.replace_change_mask(crate::spa::SPA_PORT_CHANGE_MASK_ALL as u64);
-      port_info_fun(entry.cb.data, SPA_DIRECTION_INPUT, 0, state.port_info.raw());
+      port_info_fun(entry.cb.data, SPA_DIRECTION_OUTPUT, 0, state.port_info.raw());
       let _ = state.port_info.replace_change_mask(old_mask);
     }
   });
@@ -170,7 +172,7 @@ unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param
 unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   #[cfg(debug_assertions)]
-  eprintln!("xxx on_timeout");
+  eprintln!("yyy on_timeout");
 
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
@@ -185,6 +187,8 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   let duration = (*state.position).clock.target_duration;
   let rate     = (*state.position).clock.target_rate.denom;
+
+  eprintln!("duration = {}, rate = {}", duration, rate);
 
   state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
 
@@ -204,7 +208,7 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   if let Some(ready_fun) = node_callbacks.ready {
     let err = ready_fun(state.callbacks.data, SPA_STATUS_NEED_DATA as i32);
     #[cfg(debug_assertions)]
-    eprintln!("xxx ready -> {}", err);
+    eprintln!("yyy ready -> {}", err);
     #[cfg(not(debug_assertions))]
     let _ = err;
   }
@@ -215,7 +219,7 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 unsafe fn set_timeout(state: &mut State, next_time: u64) {
 
   #[cfg(debug_assertions)]
-  eprintln!("xxx set_timeout {}", next_time);
+  eprintln!("yyy set_timeout {}", next_time);
 
   let timerspec = itimerspec {
     it_value: timespec {
@@ -232,7 +236,7 @@ unsafe fn set_timeout(state: &mut State, next_time: u64) {
 unsafe extern "C" fn set_timers(loop_: *mut spa_loop, async_: bool, seq: u32, data: *const c_void, size: usize, user_data: *mut c_void) -> c_int {
 
   #[cfg(debug_assertions)]
-  eprintln!("xxx set_timers");
+  eprintln!("yyy set_timers");
 
   let state = user_data.cast::<State>().as_mut()
     .expect("user_data is not supposed to be null");
@@ -245,10 +249,10 @@ unsafe extern "C" fn set_timers(loop_: *mut spa_loop, async_: bool, seq: u32, da
 
   if state.started && !state.following {
     #[cfg(debug_assertions)]
-    eprintln!("xxx next time {}", state.next_time);
+    eprintln!("yyy next time {}", state.next_time);
     set_timeout(state, state.next_time);
   } else {
-    eprintln!("xxx next time {}", 0);
+    eprintln!("yyy next time {}", 0);
     set_timeout(state, 0);
   }
 
@@ -335,7 +339,7 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamBegin | SPA_NODE_COMMAND_ParamEnd) => 0, // we don't care
     (cmd_type, cmd_id) => {
-      eprintln!("oss-sink: unknown command: {}, {}", cmd_type, cmd_id);
+      eprintln!("oss-source: unknown command: {}, {}", cmd_type, cmd_id);
       -libc::ENOTSUP
     }
   }
@@ -385,14 +389,14 @@ unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder) -> Resul
 
   b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
   b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-  b.add_int(2)?;
   b.add_int(1)?;
-  b.add_int(SPA_AUDIO_MAX_CHANNELS as i32)?;
+  b.add_int(1)?;
+  b.add_int(1 /*SPA_AUDIO_MAX_CHANNELS as i32*/)?;
   b.pop(inner.assume_init_mut());
 
-  b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
-  b.add_array(std::mem::size_of_val(&SPA_AUDIO_CHANNEL_FL) as u32, SPA_TYPE_Id, 2,
-              [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR].as_ptr().cast())?;
+  //b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
+  //b.add_array(std::mem::size_of_val(&SPA_AUDIO_CHANNEL_FL) as u32, SPA_TYPE_Id, 2,
+  //            [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR].as_ptr().cast())?;
 
   b.pop(outer.assume_init_mut());
 
@@ -407,7 +411,7 @@ unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder) -> Resul
   builder.push_object(&mut frame, SPA_TYPE_OBJECT_ParamPortConfig, SPA_PARAM_PortConfig)?;
 
   builder.add_prop(SPA_PARAM_PORT_CONFIG_direction, 0)?;
-  builder.add_id(libspa::utils::Id(SPA_DIRECTION_INPUT))?;
+  builder.add_id(libspa::utils::Id(SPA_DIRECTION_OUTPUT))?;
 
   builder.add_prop(SPA_PARAM_PORT_CONFIG_mode, 0)?;
   builder.add_id(libspa::utils::Id(SPA_PARAM_PORT_CONFIG_MODE_none))?;
@@ -460,7 +464,7 @@ unsafe extern "C" fn port_enum_params(
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert_eq!(direction, SPA_DIRECTION_INPUT);
+  assert_eq!(direction, SPA_DIRECTION_OUTPUT);
   assert!((port_id as usize) < MAX_PORTS);
   assert_ne!(max, 0);
 
@@ -501,7 +505,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert_eq!(direction, SPA_DIRECTION_INPUT);
+  assert_eq!(direction, SPA_DIRECTION_OUTPUT);
   assert!((port_id as usize) < MAX_PORTS);
   //assert_eq!(flags, 0);
 
@@ -516,7 +520,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
           Ok((MediaType::Audio, MediaSubtype::Raw)) => {
             let mut raw = MaybeUninit::<spa_audio_info_raw>::uninit();
             if spa_format_audio_raw_parse(param, raw.as_mut_ptr()) < 0 {
-              eprintln!("oss-sink: spa_format_audio_raw_parse failed");
+              eprintln!("oss-source: spa_format_audio_raw_parse failed");
               return -libc::EINVAL;
             }
 
@@ -526,30 +530,39 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
             //TODO: what should we do with flags?
 
             assert!(raw.rate > 0);
-            assert!(raw.channels > 0 && raw.channels <= SPA_AUDIO_MAX_CHANNELS);
+            //assert!(raw.channels > 0 && raw.channels <= SPA_AUDIO_MAX_CHANNELS);
+            assert_eq!(raw.channels, 1);
             assert_eq!(raw.flags, 0);
 
             let format    = libspa::param::audio::AudioFormat(raw.format);
             let positions = raw.position.iter().take(raw.channels as usize).copied().collect::<Vec<_>>();
 
-            eprintln!("oss-sink: requested format: {:?} (planar = {}), flags = {}, rate = {}, channels = {}, position = {:?}",
+            eprintln!("oss-source: requested format: {:?} (planar = {}), flags = {}, rate = {}, channels = {}, position = {:?}",
               format, format.is_planar(), raw.flags, raw.rate, raw.channels, positions);
 
             let config = PortConfig {
               format,
               rate:     raw.rate,
               channels: raw.channels,
-              positions
+              positions,
+              stride: match format {
+                libspa::param::audio::AudioFormat::S32LE => 4,
+                libspa::param::audio::AudioFormat::S32BE => 4,
+                libspa::param::audio::AudioFormat::S16LE => 2,
+                libspa::param::audio::AudioFormat::S16BE => 2,
+                _ => unreachable!()
+              }
             };
 
             state.ports[port_id as usize].config = Some(config);
+            state.active_buffers = 0;
           },
           Ok((t, st)) => {
-            eprintln!("oss-sink: unknown media type combination: {:?}, {:?}", t, st);
+            eprintln!("oss-source: unknown media type combination: {:?}, {:?}", t, st);
             return -libc::ENOENT;
           },
           Err(err) => {
-            eprintln!("oss-sink: parse_format failed: {}", err);
+            eprintln!("oss-source: parse_format failed: {}", err);
             return -libc::EINVAL
           }
         };
@@ -572,7 +585,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert!(state.started);
+  if !state.started {
+    return SPA_STATUS_OK as i32;
+  }
 
   let mut result = SPA_STATUS_OK as i32;
 
@@ -585,11 +600,18 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     assert!(!port.buffers.is_empty());
     assert!(!port.io.is_null());
 
-    if (*port.io).status != SPA_STATUS_HAVE_DATA as i32 {
-      return (*port.io).status; //TODO: or continue?
+    if (*port.io).status != SPA_STATUS_OK as i32 && (*port.io).status != SPA_STATUS_NEED_DATA as i32 {
+      continue;
     }
 
-    let buffer_id = (*port.io).buffer_id;
+    let buffer_id = if (*port.io).buffer_id == -1i32 as u32 {
+      let idx = state.active_buffers;
+      state.active_buffers += 1;
+      idx as u32
+    } else {
+      (*port.io).buffer_id
+    };
+
     let buffer = port.buffers.get(buffer_id as usize).unwrap().as_ref().unwrap();
 
     // no, I'm not the person that decided to pluralize "data" that way; it's completely savage
@@ -598,20 +620,35 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     let data_0 = buffer.datas.offset(0).as_ref().unwrap();
     assert_eq!(data_0.type_, SPA_DATA_MemPtr);
 
-    let offset = (*data_0.chunk).offset % data_0.maxsize; //TODO: should this be `(*data_0.chunk).offset.min(data_0.maxsize)` instead?
-    let size   = (*data_0.chunk).size.min(data_0.maxsize - offset) as libc::size_t;
+    let nbytes = if port.dsp.ready_for_reading(1) {
+      let ispace = port.dsp.ispace();
+      eprintln!("ispace: {}", ispace);
+      assert!(ispace as u32 <= data_0.maxsize);
+      port.dsp.read(data_0.data, ispace as usize)
+    } else {
+      -1
+    };
 
-    #[cfg(debug_assertions)]
-    {
-      eprintln!("xxx offset: {}, chunk size: {}", offset, size);
-      spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size) as usize);
+    if nbytes != -1 {
+      #[cfg(debug_assertions)]
+      {
+        eprintln!("yyy nbytes: {}", nbytes);
+        spa_debug_mem(0, data_0.data, 16.min(nbytes) as usize);
+      }
+
+      (*data_0.chunk).offset = 0;
+      (*data_0.chunk).size   = nbytes as u32;
+      (*data_0.chunk).stride = port.config.as_ref().unwrap().stride as i32;
+      (*data_0.chunk).flags  = 0;
+
+      (*port.io).buffer_id   = buffer_id;
+      (*port.io).status      = SPA_STATUS_HAVE_DATA as i32;
+
+      result |= SPA_STATUS_HAVE_DATA as i32;
+    } else {
+      (*port.io).buffer_id   = buffer_id; // -1i32 as u32;
+      (*port.io).status      = SPA_STATUS_OK as i32;
     }
-
-    let nbytes = port.dsp.write(data_0.data.offset(offset as isize), size);
-    assert_eq!(nbytes, size as isize);
-
-    (*port.io).status = SPA_STATUS_NEED_DATA as i32;
-    result |= SPA_STATUS_NEED_DATA as i32;
   }
 
   result
@@ -622,7 +659,7 @@ unsafe extern "C" fn port_use_buffers(object: *mut c_void, direction: spa_direct
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  assert_eq!(direction, SPA_DIRECTION_INPUT);
+  assert_eq!(direction, SPA_DIRECTION_OUTPUT);
   assert!((port_id as usize) < MAX_PORTS);
   assert_eq!(flags, 0);
 
@@ -633,12 +670,14 @@ unsafe extern "C" fn port_use_buffers(object: *mut c_void, direction: spa_direct
     state.ports[port_id as usize].buffers = vec![];
   }
 
+  state.active_buffers = 0;
+
   0
 }
 
 unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, port_id: u32, id: u32, data: *mut c_void, _size: usize) -> c_int {
 
-  assert_eq!(direction, SPA_DIRECTION_INPUT);
+  assert_eq!(direction, SPA_DIRECTION_OUTPUT);
   assert!((port_id as usize) < MAX_PORTS);
 
   let state = object.cast::<State>().as_mut()
@@ -647,6 +686,7 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
   #[allow(non_upper_case_globals)]
   match id {
     SPA_IO_Buffers => {
+      eprintln!("yyy SPA_IO_Buffers: port_id={}", port_id);
       if !data.is_null() {
         state.ports[port_id as usize].io = data.cast();
       } else {
@@ -801,15 +841,17 @@ unsafe extern "C" fn init(
     ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path) }; MAX_PORTS],
 
     started:   false,
-    following: false
+    following: false,
+
+    active_buffers: 0
   });
 
   state.node_info.fix_pointers();
 
-  state.node_info.set_max_input_ports(1);
+  state.node_info.set_max_output_ports(1);
   state.node_info.set_flags(SPA_NODE_FLAG_RT as u64);
 
-  state.node_info.add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), "Audio/Sink");
+  state.node_info.add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), "Audio/Source");
   state.node_info.add_prop(SPA_KEY_NODE_DRIVER.as_ptr(), "true");
 
   //state.node_info.add_param(SPA_PARAM_IO,             SPA_PARAM_INFO_READ);
@@ -853,16 +895,16 @@ unsafe extern "C" fn enum_interface_info(_factory: *const spa_handle_factory, in
   }
 }
 
-const OSS_SINK_FACTORY_INFO: spa_dict = spa_dict {
+const OSS_SOURCE_FACTORY_INFO: spa_dict = spa_dict {
   flags:   0,
   n_items: 0,
   items:   std::ptr::null()
 };
 
-pub const OSS_SINK_FACTORY: spa_handle_factory = spa_handle_factory {
+pub const OSS_SOURCE_FACTORY: spa_handle_factory = spa_handle_factory {
   version:             SPA_VERSION_HANDLE_FACTORY,
-  name:                c"freebsd-oss.sink".as_ptr(),
-  info:                &OSS_SINK_FACTORY_INFO,
+  name:                c"freebsd-oss.source".as_ptr(),
+  info:                &OSS_SOURCE_FACTORY_INFO,
   get_size:            Some(get_size),
   init:                Some(init),
   enum_interface_info: Some(enum_interface_info)

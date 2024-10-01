@@ -8,6 +8,8 @@ mod monitor;
 #[allow(clippy::absurd_extreme_comparisons)]
 mod sink;
 #[allow(clippy::absurd_extreme_comparisons)]
+mod source;
+#[allow(clippy::absurd_extreme_comparisons)]
 mod spa;
 
 mod keys;
@@ -17,6 +19,7 @@ mod utils;
 use device::OSS_DEVICE_FACTORY;
 use monitor::OSS_MONITOR_FACTORY;
 use sink::OSS_SINK_FACTORY;
+use source::OSS_SOURCE_FACTORY;
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
@@ -27,6 +30,7 @@ pub unsafe extern "C" fn spa_handle_factory_enum(factory: *mut *const spa_handle
     0 => { *factory = &OSS_MONITOR_FACTORY; *index += 1; 1 },
     1 => { *factory = &OSS_DEVICE_FACTORY;  *index += 1; 1 },
     2 => { *factory = &OSS_SINK_FACTORY;    *index += 1; 1 },
+    3 => { *factory = &OSS_SOURCE_FACTORY;  *index += 1; 1 },
     _ => 0
   }
 }

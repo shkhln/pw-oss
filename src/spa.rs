@@ -251,6 +251,11 @@ impl NodeInfo {
     self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64; // does this field count as a flag?
   }
 
+  pub fn set_max_output_ports(&mut self, max_ports: u32) {
+    self.info.max_output_ports = max_ports;
+    self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64; // does this field count as a flag?
+  }
+
   pub fn set_flags(&mut self, flags: u64) {
     self.info.flags = flags;
     self.info.change_mask |= SPA_NODE_CHANGE_MASK_FLAGS as u64;
