@@ -8,9 +8,20 @@ pub const AFMT_S16_BE: u32 = 0x00000020;
 pub const AFMT_S32_LE: u32 = 0x00001000;
 pub const AFMT_S32_BE: u32 = 0x00002000;
 
-const SNDCTL_DSP_SPEED:    c_ulong = nix::request_code_readwrite!(b'P', 2, std::mem::size_of::<c_int>());
-const SNDCTL_DSP_SETFMT:   c_ulong = nix::request_code_readwrite!(b'P', 5, std::mem::size_of::<c_int>());
-const SNDCTL_DSP_CHANNELS: c_ulong = nix::request_code_readwrite!(b'P', 6, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_SPEED:      c_ulong = nix::request_code_readwrite!(b'P',  2, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_SETFMT:     c_ulong = nix::request_code_readwrite!(b'P',  5, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_CHANNELS:   c_ulong = nix::request_code_readwrite!(b'P',  6, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_GETISPACE:  c_ulong = nix::request_code_read!     (b'P', 13, std::mem::size_of::<audio_buf_info>());
+//const SNDCTL_DSP_GETPLAYVOL: c_ulong = nix::request_code_read!     (b'P', 24, std::mem::size_of::<c_int>());
+//const SNDCTL_DSP_SETPLAYVOL: c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
+
+#[repr(C)]
+struct audio_buf_info {
+  fragments:  c_int,
+  fragstotal: c_int,
+  fragsize:   c_int,
+  bytes:      c_int
+}
 
 #[derive(Debug, PartialEq)]
 enum DspState {
@@ -78,12 +89,48 @@ impl Dsp {
     assert_eq!(n, rate as c_int);
   }
 
+  pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
+    if self.state == DspState::Setup {
+      self.state = DspState::Running;
+    }
+    assert_eq!(self.state, DspState::Running);
+    libc::read(self.fd, buf, count)
+  }
+
   pub unsafe fn write(&mut self, buf: *const c_void, count: size_t) -> ssize_t {
     if self.state == DspState::Setup {
       self.state = DspState::Running;
     }
     assert_eq!(self.state, DspState::Running);
     libc::write(self.fd, buf, count)
+  }
+
+  pub fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
+
+    if self.state == DspState::Setup {
+      self.state = DspState::Running;
+    }
+
+    assert_eq!(self.state, DspState::Running);
+
+    let mut read_fds = std::mem::MaybeUninit::<libc::fd_set>::uninit();
+    unsafe {
+      libc::FD_ZERO(read_fds.as_mut_ptr());
+      libc::FD_SET(self.fd, read_fds.as_mut_ptr());
+    }
+
+    let mut timeout = libc::timeval { tv_sec: 0, tv_usec: timeout_ms as i64 * 1000 };
+
+    let ndesc = unsafe { libc::select(self.fd + 1, read_fds.assume_init_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut timeout) };
+    ndesc != -1 && ndesc > 0
+  }
+
+  pub fn ispace_in_bytes(&mut self) -> c_int {
+    assert_eq!(self.state, DspState::Running);
+    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
+    let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) };
+    assert_ne!(err, -1);
+    unsafe { info.assume_init().bytes }
   }
 }
 
@@ -122,7 +169,9 @@ pub fn read_sndstat() -> Result<Vec<u32>, Errno> {
 pub struct PcmDevice {
   pub index:    u32,
   pub desc:     String,
-  pub location: String
+  pub location: String,
+  pub play:     bool,
+  pub rec:      bool
 }
 
 pub fn read_pcm_device_description(sysctl: &mut crate::utils::SysctlReader, index: u32) -> Option<String> {
@@ -155,7 +204,9 @@ pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
   for index in indexes {
     if let Some(desc) = read_pcm_device_description(&mut sysctl, *index) {
       if let Ok(location) = sysctl.read_string(format!("dev.pcm.{}.%location", index), 1024) {
-        result.push(PcmDevice { index: *index, desc, location });
+        let play = sysctl.read_string(format!("dev.pcm.{}.play.vchanformat", index), 1024).is_ok();
+        let rec  = sysctl.read_string(format!("dev.pcm.{}.rec.vchanformat",  index), 1024).is_ok();
+        result.push(PcmDevice { index: *index, desc, location, play, rec });
       }
     }
   }

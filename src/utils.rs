@@ -57,3 +57,58 @@ impl SysctlReader {
     Ok(String::from_utf8_lossy(&self.scratch_buffer[0..len]).to_string())
   }
 }
+
+pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono: bool) -> Result<(), Errno> {
+
+  use libspa::sys::*;
+
+  let mut outer = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+  let mut inner = std::mem::MaybeUninit::<spa_pod_frame>::uninit();
+
+  b.push_object(&mut outer, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat)?;
+
+  b.add_prop(SPA_FORMAT_mediaType, 0)?;
+  b.add_id(libspa::utils::Id(SPA_MEDIA_TYPE_audio))?;
+
+  b.add_prop(SPA_FORMAT_mediaSubtype, 0)?;
+  b.add_id(libspa::utils::Id(SPA_MEDIA_SUBTYPE_raw))?;
+
+  b.add_prop(SPA_FORMAT_AUDIO_format, 0)?;
+  b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
+  for fmt in [
+    SPA_AUDIO_FORMAT_S32,
+    SPA_AUDIO_FORMAT_S32_OE,
+    SPA_AUDIO_FORMAT_S16,
+    SPA_AUDIO_FORMAT_S16_OE
+  ] {
+    b.add_id(libspa::utils::Id(fmt))?;
+  }
+  b.pop(inner.assume_init_mut());
+
+  b.add_prop(SPA_FORMAT_AUDIO_rate, 0)?;
+  b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+  b.add_int( 48000)?;
+  b.add_int(     1)?;
+  b.add_int(192000)?;
+  b.pop(inner.assume_init_mut());
+
+  if !mono {
+    b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
+    b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
+    b.add_int(2)?;
+    b.add_int(1)?;
+    b.add_int(SPA_AUDIO_MAX_CHANNELS as i32)?;
+    b.pop(inner.assume_init_mut());
+
+    b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
+    b.add_array(std::mem::size_of_val(&SPA_AUDIO_CHANNEL_FL) as u32, SPA_TYPE_Id, 2,
+      [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR].as_ptr().cast())?;
+  } else {
+    b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
+    b.add_int(1)?;
+  }
+
+  b.pop(outer.assume_init_mut());
+
+  Ok(())
+}
