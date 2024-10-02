@@ -105,7 +105,7 @@ impl Dsp {
     libc::write(self.fd, buf, count)
   }
 
-  pub unsafe fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
+  pub fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
 
     if self.state == DspState::Setup {
       self.state = DspState::Running;
@@ -114,22 +114,26 @@ impl Dsp {
     assert_eq!(self.state, DspState::Running);
 
     let mut read_fds = std::mem::MaybeUninit::<libc::fd_set>::uninit();
-    libc::FD_ZERO(read_fds.as_mut_ptr());
-    libc::FD_SET(self.fd, read_fds.assume_init_mut());
+    unsafe {
+      libc::FD_ZERO(read_fds.as_mut_ptr());
+      libc::FD_SET(self.fd, read_fds.as_mut_ptr());
+    }
 
     let mut timeout = libc::timeval { tv_sec: 0, tv_usec: timeout_ms as i64 * 1000 };
 
-    let ndesc = libc::select(self.fd + 1, read_fds.assume_init_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut timeout);
-    assert_ne!(ndesc, -1);
-
-    ndesc > 0
+    unsafe {
+      let ndesc = libc::select(self.fd + 1, read_fds.assume_init_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut timeout);
+      assert_ne!(ndesc, -1);
+      ndesc > 0
+    }
   }
 
-  pub unsafe fn ispace(&mut self) -> c_int {
+  pub fn ispace_in_bytes(&mut self) -> c_int {
+    assert_eq!(self.state, DspState::Running);
     let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
     let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) };
     assert_ne!(err, -1);
-    info.assume_init().bytes
+    unsafe { info.assume_init().bytes }
   }
 }
 

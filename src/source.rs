@@ -621,7 +621,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     assert_eq!(data_0.type_, SPA_DATA_MemPtr);
 
     let nbytes = if port.dsp.ready_for_reading(1) {
-      let ispace = port.dsp.ispace();
+      let ispace = port.dsp.ispace_in_bytes();
       eprintln!("ispace: {}", ispace);
       assert!(ispace as u32 <= data_0.maxsize);
       port.dsp.read(data_0.data, ispace as usize)
