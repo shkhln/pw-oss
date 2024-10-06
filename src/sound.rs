@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::raw::{c_int, c_ulong, c_void};
 use libc::{size_t, ssize_t};
@@ -129,8 +130,11 @@ impl Dsp {
     assert_eq!(self.state, DspState::Running);
     let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
     let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) };
-    assert_ne!(err, -1);
-    unsafe { info.assume_init().bytes }
+    if err != -1 {
+      unsafe { info.assume_init().bytes }
+    } else {
+      0
+    }
   }
 }
 
@@ -194,6 +198,18 @@ pub fn read_pcm_device_description(sysctl: &mut crate::utils::SysctlReader, inde
   }
 
   sysctl.read_string(format!("dev.pcm.{}.%desc", index), 1024).ok()
+}
+
+pub fn group_pcm_devices_by_parent(indexes: &[u32]) -> BTreeMap<String, Vec<u32>> {
+  let mut sysctl = crate::utils::SysctlReader::new();
+  let mut indexes_by_parent: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+  for index in indexes {
+    if let Ok(parent) = sysctl.read_string(format!("dev.pcm.{}.%parent", index), 1024) {
+      let values = indexes_by_parent.entry(parent).or_default();
+      values.push(*index);
+    }
+  }
+  indexes_by_parent
 }
 
 pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {

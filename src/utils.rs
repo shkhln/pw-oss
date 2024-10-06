@@ -58,6 +58,38 @@ impl SysctlReader {
   }
 }
 
+use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
+use uds::UnixSeqpacketConn;
+
+pub struct DevdSocket {
+  socket: UnixSeqpacketConn,
+  buffer: Vec<u8>
+}
+
+impl DevdSocket {
+
+  pub fn open() -> Result<Self, std::io::Error> {
+    let socket = UnixSeqpacketConn::connect("/var/run/devd.seqpacket.pipe")?;
+    let buffer = [0; 8192 /* DEVCTL_MAXBUF */].to_vec();
+    Ok(Self {
+      socket,
+      buffer
+    })
+  }
+
+  pub fn fd(&self) -> RawFd {
+    self.socket.as_raw_fd()
+  }
+
+  pub fn read_event(&mut self, mut apply: impl FnMut(&str)) {
+    if let Ok(len) = self.socket.recv(&mut self.buffer) {
+      assert!(len <= self.buffer.len());
+      apply(std::str::from_utf8(&self.buffer[..len]).unwrap());
+    }
+  }
+}
+
 pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono: bool) -> Result<(), Errno> {
 
   use libspa::sys::*;
