@@ -121,11 +121,8 @@ impl Dsp {
 
     let mut timeout = libc::timeval { tv_sec: 0, tv_usec: timeout_ms as i64 * 1000 };
 
-    unsafe {
-      let ndesc = libc::select(self.fd + 1, read_fds.assume_init_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut timeout);
-      assert_ne!(ndesc, -1);
-      ndesc > 0
-    }
+    let ndesc = unsafe { libc::select(self.fd + 1, read_fds.assume_init_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut timeout) };
+    ndesc != -1 && ndesc > 0
   }
 
   pub fn ispace_in_bytes(&mut self) -> c_int {

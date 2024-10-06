@@ -2,7 +2,6 @@ use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_void};
 
 use libspa::sys::*;
-use nix::errno::Errno;
 
 const MAX_PORTS: usize = 1;
 
@@ -351,54 +350,6 @@ unsafe extern "C" fn remove_port(object: *mut c_void, direction: spa_direction, 
   unimplemented!()
 }
 
-unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder) -> Result<(), Errno> {
-
-  let mut outer = MaybeUninit::<spa_pod_frame>::uninit();
-  let mut inner = MaybeUninit::<spa_pod_frame>::uninit();
-
-  b.push_object(&mut outer, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat)?;
-
-  b.add_prop(SPA_FORMAT_mediaType, 0)?;
-  b.add_id(libspa::utils::Id(SPA_MEDIA_TYPE_audio))?;
-
-  b.add_prop(SPA_FORMAT_mediaSubtype, 0)?;
-  b.add_id(libspa::utils::Id(SPA_MEDIA_SUBTYPE_raw))?;
-
-  b.add_prop(SPA_FORMAT_AUDIO_format, 0)?;
-  b.push_choice(&mut inner, SPA_CHOICE_Enum, 0)?;
-  for fmt in [
-    SPA_AUDIO_FORMAT_S32,
-    SPA_AUDIO_FORMAT_S32_OE,
-    SPA_AUDIO_FORMAT_S16,
-    SPA_AUDIO_FORMAT_S16_OE
-  ] {
-    b.add_id(libspa::utils::Id(fmt))?;
-  }
-  b.pop(inner.assume_init_mut());
-
-  b.add_prop(SPA_FORMAT_AUDIO_rate, 0)?;
-  b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-  b.add_int( 48000)?;
-  b.add_int(     1)?;
-  b.add_int(192000)?;
-  b.pop(inner.assume_init_mut());
-
-  b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
-  b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-  b.add_int(2)?;
-  b.add_int(1)?;
-  b.add_int(SPA_AUDIO_MAX_CHANNELS as i32)?;
-  b.pop(inner.assume_init_mut());
-
-  b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
-  b.add_array(std::mem::size_of_val(&SPA_AUDIO_CHANNEL_FL) as u32, SPA_TYPE_Id, 2,
-              [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR].as_ptr().cast())?;
-
-  b.pop(outer.assume_init_mut());
-
-  Ok(())
-}
-
 //TODO: SPA_PARAM_PORT_CONFIG_MODE_none vs SPA_PARAM_PORT_CONFIG_MODE_passthrough vs SPA_PARAM_PORT_CONFIG_MODE_convert
 /*unsafe fn build_port_config_info(builder: &mut libspa::pod::builder::Builder, config: &PortConfig, id: u32) -> Result<(), Errno> {
 
@@ -477,7 +428,7 @@ unsafe extern "C" fn port_enum_params(
 
     #[allow(non_upper_case_globals)]
     match (id, index) {
-      (SPA_PARAM_EnumFormat, 0) => build_enum_format_info(&mut builder).unwrap(),
+      (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, false).unwrap(),
       (SPA_PARAM_EnumFormat, _) => return 0,
       (SPA_PARAM_Buffers, _)    => return 0,
       _ => return -libc::EINVAL

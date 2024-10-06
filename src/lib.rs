@@ -16,10 +16,10 @@ mod keys;
 mod sound;
 mod utils;
 
-use device::OSS_DEVICE_FACTORY;
+use device ::OSS_DEVICE_FACTORY;
 use monitor::OSS_MONITOR_FACTORY;
-use sink::OSS_SINK_FACTORY;
-use source::OSS_SOURCE_FACTORY;
+use sink   ::OSS_SINK_FACTORY;
+use source ::OSS_SOURCE_FACTORY;
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
