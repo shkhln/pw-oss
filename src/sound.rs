@@ -129,8 +129,11 @@ impl Dsp {
     assert_eq!(self.state, DspState::Running);
     let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
     let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) };
-    assert_ne!(err, -1);
-    unsafe { info.assume_init().bytes }
+    if err != -1 {
+      unsafe { info.assume_init().bytes }
+    } else {
+      0
+    }
   }
 }
 
