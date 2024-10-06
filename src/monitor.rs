@@ -31,6 +31,7 @@ impl PcmDevices {
   pub fn read_from_sndstat(&mut self) -> nix::Result<()> {
     let pcm_device_indexes = crate::sound::read_sndstat()?;
     let mut sysctl = crate::utils::SysctlReader::new();
+    self.indexes_by_parent.clear();
     for index in pcm_device_indexes {
       if let Ok(parent) = sysctl.read_string(format!("dev.pcm.{}.%parent", index), 1024) {
         let values = self.indexes_by_parent.entry(parent).or_default();
