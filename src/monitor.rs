@@ -16,7 +16,7 @@ struct State {
   devd_source: spa_source
 }
 
-fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, indexes: &Vec<u32>) {
+fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, indexes: &[u32]) {
 
   let indexes_str = indexes.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(",");
 
@@ -38,7 +38,7 @@ fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, inde
   }
 }
 
-fn remove_dev_node(hook: &spa_hook, events: &spa_device_events, indexes: &Vec<u32>) {
+fn remove_dev_node(hook: &spa_hook, events: &spa_device_events, indexes: &[u32]) {
 
   if let Some(obj_info_fun) = events.object_info {
     unsafe { obj_info_fun(hook.cb.data, indexes[0], std::ptr::null()) };
@@ -129,33 +129,29 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
 
     let re = regex::Regex::new(r"^([\+-])(uaudio\d+)").unwrap();
     if let Some(groups) = re.captures(line) {
-      if let Some(change) = groups.get(1) {
-        if let Some(driver) = groups.get(2) {
 
-          if change.as_str() == "+" {
-            state.pcm_indexes = crate::sound::group_pcm_devices_by_parent(&crate::sound::read_sndstat().unwrap());
-            if let Some(indexes) = state.pcm_indexes.get(driver.as_str()) {
-              eprintln!("oss-monitor: registering {} ({:?})", driver.as_str(), indexes);
-              crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
-                  .expect("callback should be initialized");
-                assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
-                emit_dev_node(entry, f, driver.as_str(), indexes);
-              });
-            }
-          } else {
-            if let Some(indexes) = state.pcm_indexes.remove(driver.as_str()) {
-              eprintln!("oss-monitor: removing {} ({:?})", driver.as_str(), indexes);
-              crate::spa::for_each_hook(&mut state.hooks, |entry| {
-                let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
-                  .expect("callback should be initialized");
-                assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
-                remove_dev_node(entry, f, &indexes);
-              });
-            }
-          }
+      let change = groups.get(1).unwrap();
+      let driver = groups.get(2).unwrap();
 
+      if change.as_str() == "+" {
+        state.pcm_indexes = crate::sound::group_pcm_devices_by_parent(&crate::sound::read_sndstat().unwrap());
+        if let Some(indexes) = state.pcm_indexes.get(driver.as_str()) {
+          eprintln!("oss-monitor: registering {} ({:?})", driver.as_str(), indexes);
+          crate::spa::for_each_hook(&mut state.hooks, |entry| {
+            let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+              .expect("callback should be initialized");
+            assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+            emit_dev_node(entry, f, driver.as_str(), indexes);
+          });
         }
+      } else if let Some(indexes) = state.pcm_indexes.remove(driver.as_str()) {
+        eprintln!("oss-monitor: removing {} ({:?})", driver.as_str(), indexes);
+        crate::spa::for_each_hook(&mut state.hooks, |entry| {
+          let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+            .expect("callback should be initialized");
+          assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+          remove_dev_node(entry, f, &indexes);
+        });
       }
     }
   });
