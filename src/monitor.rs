@@ -144,7 +144,7 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
               });
             }
           } else {
-            if let Some(indexes) = state.pcm_indexes.get(driver.as_str()) {
+            if let Some(indexes) = state.pcm_indexes.remove(driver.as_str()) {
               eprintln!("oss-monitor: removing {} ({:?})", driver.as_str(), indexes);
               crate::spa::for_each_hook(&mut state.hooks, |entry| {
                 let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
