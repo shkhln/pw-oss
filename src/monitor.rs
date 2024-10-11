@@ -12,7 +12,7 @@ struct State {
   dev_info:    spa_device_info,
   hooks:       spa_hook_list,
   devices:     PcmDevices,
-  devd_socket: DevdSocket,
+  devd_socket: crate::utils::DevdSocket,
   devd_source: spa_source
 }
 
@@ -142,38 +142,6 @@ const DEV_INFO_PROPS: spa_dict = spa_dict {
   items:   std::ptr::null()
 };
 
-use std::os::fd::AsRawFd;
-use std::os::fd::RawFd;
-use uds::UnixSeqpacketConn;
-
-struct DevdSocket {
-  socket: UnixSeqpacketConn,
-  buffer: Vec<u8>
-}
-
-impl DevdSocket {
-
-  pub fn open() -> Result<Self, std::io::Error> {
-    let socket = UnixSeqpacketConn::connect("/var/run/devd.seqpacket.pipe")?;
-    let buffer = [0; 1024].to_vec(); //TODO: what's the max packet length?
-    Ok(Self {
-      socket,
-      buffer
-    })
-  }
-
-  pub fn fd(&self) -> RawFd {
-    self.socket.as_raw_fd()
-  }
-
-  pub fn read_packet(&mut self, mut apply: impl FnMut(&str)) {
-    if let Ok(len) = self.socket.recv(&mut self.buffer) {
-      assert!(len <= self.buffer.len());
-      apply(std::str::from_utf8(&self.buffer[..len]).unwrap());
-    }
-  }
-}
-
 unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
 
   #[cfg(debug_assertions)]
@@ -182,47 +150,40 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
 
-  state.devd_socket.read_packet(|line| {
+  state.devd_socket.read_event(|line| {
 
-    //eprintln!("devd event: {}", line);
-
-    if line.starts_with("+uaudio") {
-      let re = regex::Regex::new(r"^\+(uaudio\d+)").unwrap();
-      if let Some(groups) = re.captures(line) {
-        if let Some(driver) = groups.get(1) {
-
-          state.devices.read_from_sndstat().unwrap();
-
-          crate::spa::for_each_hook(&mut state.hooks, |entry| {
-
-            let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
-              .expect("callback should be initialized");
-            assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
-
-            if let Some(indexes) = state.devices.indexes_by_parent.get(driver.as_str()) {
-              emit_dev_node(entry, f, driver.as_str(), indexes);
-            }
-          });
-        }
-      }
+    if !(line.starts_with("+uaudio") || line.starts_with("-uaudio")) {
+      return;
     }
 
-    if line.starts_with("-uaudio") {
-      let re = regex::Regex::new(r"^-(uaudio\d+)").unwrap();
-      if let Some(groups) = re.captures(line) {
-        if let Some(driver) = groups.get(1) {
-          if let Some(indexes) = state.devices.indexes_by_parent.remove(driver.as_str()) {
-            eprintln!("oss-monitor: removing {} ({:?})", driver.as_str(), indexes);
+    let re = regex::Regex::new(r"^([\+-])(uaudio\d+)").unwrap();
+    if let Some(groups) = re.captures(line) {
+      if let Some(change) = groups.get(1) {
+        if let Some(driver) = groups.get(2) {
 
-            crate::spa::for_each_hook(&mut state.hooks, |entry| {
-
-              let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
-                .expect("callback should be initialized");
-              assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
-
-              remove_dev_node(entry, f, &indexes);
-            });
+          if change.as_str() == "+" {
+            state.devices.read_from_sndstat().unwrap();
+            if let Some(indexes) = state.devices.indexes_by_parent.get(driver.as_str()) {
+              eprintln!("oss-monitor: registering {} ({:?})", driver.as_str(), indexes);
+              crate::spa::for_each_hook(&mut state.hooks, |entry| {
+                let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+                  .expect("callback should be initialized");
+                assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+                emit_dev_node(entry, f, driver.as_str(), indexes);
+              });
+            }
+          } else {
+            if let Some(indexes) = state.devices.indexes_by_parent.get(driver.as_str()) {
+              eprintln!("oss-monitor: removing {} ({:?})", driver.as_str(), indexes);
+              crate::spa::for_each_hook(&mut state.hooks, |entry| {
+                let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
+                  .expect("callback should be initialized");
+                assert!(f.version >= SPA_VERSION_DEVICE_EVENTS);
+                remove_dev_node(entry, f, &indexes);
+              });
+            }
           }
+
         }
       }
     }
@@ -255,7 +216,7 @@ unsafe extern "C" fn init(
     return -(err as c_int);
   }
 
-  let devd_socket = DevdSocket::open().unwrap();
+  let devd_socket = crate::utils::DevdSocket::open().unwrap();
   let devd_source = spa_source {
     loop_: std::ptr::null_mut(),
     func:  Some(on_devd_event),
