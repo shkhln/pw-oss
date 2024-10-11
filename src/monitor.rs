@@ -11,35 +11,9 @@ struct State {
   device:      spa_device,
   dev_info:    spa_device_info,
   hooks:       spa_hook_list,
-  devices:     PcmDevices,
+  pcm_indexes: BTreeMap<String, Vec<u32>>,
   devd_socket: crate::utils::DevdSocket,
   devd_source: spa_source
-}
-
-struct PcmDevices {
-  indexes_by_parent: BTreeMap<String, Vec<u32>>
-}
-
-impl PcmDevices {
-
-  pub fn new() -> Self {
-    Self {
-      indexes_by_parent: BTreeMap::new()
-    }
-  }
-
-  pub fn read_from_sndstat(&mut self) -> nix::Result<()> {
-    let pcm_device_indexes = crate::sound::read_sndstat()?;
-    let mut sysctl = crate::utils::SysctlReader::new();
-    self.indexes_by_parent.clear();
-    for index in pcm_device_indexes {
-      if let Ok(parent) = sysctl.read_string(format!("dev.pcm.{}.%parent", index), 1024) {
-        let values = self.indexes_by_parent.entry(parent).or_default();
-        values.push(index);
-      }
-    }
-    Ok(())
-  }
 }
 
 fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, indexes: &Vec<u32>) {
@@ -92,7 +66,7 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
       dev_info_fun(entry.cb.data, &state.dev_info);
     }
 
-    for (parent, indexes) in &state.devices.indexes_by_parent {
+    for (parent, indexes) in &state.pcm_indexes {
       emit_dev_node(entry, f, parent, indexes);
     }
   });
@@ -144,9 +118,6 @@ const DEV_INFO_PROPS: spa_dict = spa_dict {
 
 unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
 
-  #[cfg(debug_assertions)]
-  eprintln!("on_devd_event");
-
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
 
@@ -162,8 +133,8 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
         if let Some(driver) = groups.get(2) {
 
           if change.as_str() == "+" {
-            state.devices.read_from_sndstat().unwrap();
-            if let Some(indexes) = state.devices.indexes_by_parent.get(driver.as_str()) {
+            state.pcm_indexes = crate::sound::group_pcm_devices_by_parent(&crate::sound::read_sndstat().unwrap());
+            if let Some(indexes) = state.pcm_indexes.get(driver.as_str()) {
               eprintln!("oss-monitor: registering {} ({:?})", driver.as_str(), indexes);
               crate::spa::for_each_hook(&mut state.hooks, |entry| {
                 let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
@@ -173,7 +144,7 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
               });
             }
           } else {
-            if let Some(indexes) = state.devices.indexes_by_parent.get(driver.as_str()) {
+            if let Some(indexes) = state.pcm_indexes.get(driver.as_str()) {
               eprintln!("oss-monitor: removing {} ({:?})", driver.as_str(), indexes);
               crate::spa::for_each_hook(&mut state.hooks, |entry| {
                 let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
@@ -210,11 +181,13 @@ unsafe extern "C" fn init(
   let state = handle.cast::<State>().as_mut()
     .expect("handle is not supposed to be null");
 
-  let mut devices = PcmDevices::new();
-  if let Err(err) = devices.read_from_sndstat() {
-    eprintln!("Can't open /dev/sndstat: {}", err);
-    return -(err as c_int);
-  }
+  let pcm_indexes = match crate::sound::read_sndstat() {
+    Ok(indexes) => crate::sound::group_pcm_devices_by_parent(&indexes),
+    Err(err)    => {
+      eprintln!("Can't open /dev/sndstat: {}", err);
+      return -(err as c_int);
+    }
+  };
 
   let devd_socket = crate::utils::DevdSocket::open().unwrap();
   let devd_source = spa_source {
@@ -262,7 +235,7 @@ unsafe extern "C" fn init(
       }
     },
 
-    devices,
+    pcm_indexes,
 
     devd_socket,
     devd_source
