@@ -13,6 +13,7 @@ struct State {
   port_info:      crate::spa::PortInfo,
   data_loop:      crate::spa::Loop,
   data_system:    crate::spa::System,
+  log:            crate::spa::Log,
   clock:          *mut spa_io_clock,
   position:       *mut spa_io_position,
   timer_source:   spa_source,
@@ -170,11 +171,11 @@ unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param
 
 unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
-  #[cfg(debug_assertions)]
-  eprintln!("yyy on_timeout");
-
   let state = (*source).data.cast::<State>().as_mut()
     .expect("(*source).data is not supposed to be null");
+
+  #[cfg(debug_assertions)]
+  crate::trace!(state.log, "on_timeout");
 
   let mut expirations = 0;
   let err = state.data_system.timerfd_read(state.timer_source.fd, &mut expirations);
@@ -187,7 +188,7 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let duration = (*state.position).clock.target_duration;
   let rate     = (*state.position).clock.target_rate.denom;
 
-  eprintln!("duration = {}, rate = {}", duration, rate);
+  crate::trace!(state.log, "duration = {}, rate = {}", duration, rate);
 
   state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
 
@@ -207,7 +208,7 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   if let Some(ready_fun) = node_callbacks.ready {
     let err = ready_fun(state.callbacks.data, SPA_STATUS_NEED_DATA as i32);
     #[cfg(debug_assertions)]
-    eprintln!("yyy ready -> {}", err);
+    crate::trace!(state.log, "ready -> {}", err);
     #[cfg(not(debug_assertions))]
     let _ = err;
   }
@@ -218,7 +219,7 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 unsafe fn set_timeout(state: &mut State, next_time: u64) {
 
   #[cfg(debug_assertions)]
-  eprintln!("yyy set_timeout {}", next_time);
+  crate::trace!(state.log, "set_timeout {}", next_time);
 
   let timerspec = itimerspec {
     it_value: timespec {
@@ -234,11 +235,11 @@ unsafe fn set_timeout(state: &mut State, next_time: u64) {
 #[allow(unused_variables)]
 unsafe extern "C" fn set_timers(loop_: *mut spa_loop, async_: bool, seq: u32, data: *const c_void, size: usize, user_data: *mut c_void) -> c_int {
 
-  #[cfg(debug_assertions)]
-  eprintln!("yyy set_timers");
-
   let state = user_data.cast::<State>().as_mut()
     .expect("user_data is not supposed to be null");
+
+  #[cfg(debug_assertions)]
+  crate::trace!(state.log, "set_timers");
 
   let mut now = timespec { tv_sec: 0, tv_nsec: 0 };
   let err = state.data_system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
@@ -248,10 +249,11 @@ unsafe extern "C" fn set_timers(loop_: *mut spa_loop, async_: bool, seq: u32, da
 
   if state.started && !state.following {
     #[cfg(debug_assertions)]
-    eprintln!("yyy next time {}", state.next_time);
+    crate::trace!(state.log, "next time {}", state.next_time);
     set_timeout(state, state.next_time);
   } else {
-    eprintln!("yyy next time {}", 0);
+    #[cfg(debug_assertions)]
+    crate::trace!(state.log, "next time {}", 0);
     set_timeout(state, 0);
   }
 
@@ -338,7 +340,7 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
     },
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamBegin | SPA_NODE_COMMAND_ParamEnd) => 0, // we don't care
     (cmd_type, cmd_id) => {
-      eprintln!("oss-source: unknown command: {}, {}", cmd_type, cmd_id);
+      crate::warn!(state.log, "oss-source: unknown command: {}, {}", cmd_type, cmd_id);
       -libc::ENOTSUP
     }
   }
@@ -471,7 +473,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
           Ok((MediaType::Audio, MediaSubtype::Raw)) => {
             let mut raw = MaybeUninit::<spa_audio_info_raw>::uninit();
             if spa_format_audio_raw_parse(param, raw.as_mut_ptr()) < 0 {
-              eprintln!("oss-source: spa_format_audio_raw_parse failed");
+              crate::warn!(state.log, "spa_format_audio_raw_parse failed");
               return -libc::EINVAL;
             }
 
@@ -487,7 +489,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
             let format    = libspa::param::audio::AudioFormat(raw.format);
             let positions = raw.position.iter().take(raw.channels as usize).copied().collect::<Vec<_>>();
 
-            eprintln!("oss-source: requested format: {:?} (planar = {}), flags = {}, rate = {}, channels = {}, position = {:?}",
+            crate::info!(state.log, "requested format: {:?} (planar = {}), flags = {}, rate = {}, channels = {}, position = {:?}",
               format, format.is_planar(), raw.flags, raw.rate, raw.channels, positions);
 
             let config = PortConfig {
@@ -508,11 +510,11 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
             state.active_buffers = 0;
           },
           Ok((t, st)) => {
-            eprintln!("oss-source: unknown media type combination: {:?}, {:?}", t, st);
+            crate::warn!(state.log, "unknown media type combination: {:?}, {:?}", t, st);
             return -libc::ENOENT;
           },
           Err(err) => {
-            eprintln!("oss-source: parse_format failed: {}", err);
+            crate::warn!(state.log, "parse_format failed: {}", err);
             return -libc::EINVAL
           }
         };
@@ -572,7 +574,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     let nbytes = if port.dsp.ready_for_reading(1) {
       let ispace = port.dsp.ispace_in_bytes();
-      eprintln!("ispace: {}", ispace);
+      #[cfg(debug_assertions)]
+      crate::trace!(state.log, "ispace: {}", ispace);
       assert!(ispace as u32 <= data_0.maxsize);
       port.dsp.read(data_0.data, ispace as usize)
     } else {
@@ -581,8 +584,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     if nbytes != -1 {
       #[cfg(debug_assertions)]
-      {
-        eprintln!("yyy nbytes: {}", nbytes);
+      if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {
+        crate::trace!(state.log, "nbytes: {}", nbytes);
         spa_debug_mem(0, data_0.data, 16.min(nbytes) as usize);
       }
 
@@ -636,7 +639,7 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
   #[allow(non_upper_case_globals)]
   match id {
     SPA_IO_Buffers => {
-      eprintln!("yyy SPA_IO_Buffers: port_id={}", port_id);
+      crate::debug!(state.log, "SPA_IO_Buffers: port_id={}", port_id);
       if !data.is_null() {
         state.ports[port_id as usize].io = data.cast();
       } else {
@@ -704,6 +707,9 @@ unsafe extern "C" fn init(
   n_support: u32
 ) -> c_int
 {
+  let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) as *mut spa_log;
+  let log = crate::spa::Log::wrap(log);
+
   let data_loop   = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataLoop  .as_ptr().cast()) as *mut spa_loop;
   let data_system = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataSystem.as_ptr().cast()) as *mut spa_system;
 
@@ -760,6 +766,7 @@ unsafe extern "C" fn init(
 
     data_loop,
     data_system,
+    log,
 
     clock:    std::ptr::null_mut(),
     position: std::ptr::null_mut(),

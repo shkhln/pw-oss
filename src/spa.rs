@@ -353,7 +353,7 @@ pub struct Loop {
 impl Loop {
 
   pub unsafe fn wrap(loop_: *mut spa_loop) -> Self {
-    let loop_  = loop_.cast::<spa_loop>().as_ref()
+    let loop_   = loop_.cast::<spa_loop>().as_ref()
       .expect("loop should be initialized");
     let methods = loop_.iface.cb.funcs.cast::<spa_loop_methods>().as_ref()
       .expect("loop methods should be initialized");
@@ -411,4 +411,81 @@ impl System {
     let spa_system_timerfd_settime = self.methods.timerfd_settime.expect("timerfd_settime should be initialized");
     spa_system_timerfd_settime(self.system.iface.cb.data, fd, flags, new_value, old_value)
   }
+}
+
+pub struct Log {
+  logger:  &'static spa_log,        // not really 'static, but it should outlive our plugin anyway
+  methods: &'static spa_log_methods // ditto
+}
+
+//TODO: spa_log_topic?
+impl Log {
+
+  pub unsafe fn wrap(log: *mut spa_log) -> Self {
+    let logger  = log.cast::<spa_log>().as_ref()
+      .expect("log should be initialized");
+    let methods = logger.iface.cb.funcs.cast::<spa_log_methods>().as_ref()
+      .expect("log methods should be initialized");
+    assert!(methods.version >= SPA_VERSION_LOG_METHODS);
+    Self { logger, methods }
+  }
+
+  pub fn log_level(&self) -> spa_log_level {
+    self.logger.level
+  }
+
+  pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
+    let log  = self.methods.log.expect("log should be initialized");
+    let file = CString::new(file).unwrap();
+    let func = CString::new(func).unwrap();
+    let msg  = CString::new(msg) .unwrap();
+    unsafe { log(self.logger.iface.cb.data, level, file.as_ptr(), line, func.as_ptr(), c"%s".as_ptr(), msg.as_ptr()); }
+  }
+}
+
+#[macro_export]
+macro_rules! log {
+  ($log:expr, $log_level:expr, $($arg:tt)*) => {
+    if $log.log_level() >= $log_level {
+      let file = file!();
+      let line = line!();
+      let func = ""; //TODO: add something there?
+      $log.log($log_level, file, line as c_int, func, &format!($($arg)*));
+    }
+  };
+}
+
+#[macro_export]
+macro_rules! error {
+  ($log:expr, $($arg:tt)*) => {
+    $crate::log!($log, SPA_LOG_LEVEL_ERROR, $($arg)*)
+  };
+}
+
+#[macro_export]
+macro_rules! warn {
+  ($log:expr, $($arg:tt)*) => {
+    $crate::log!($log, SPA_LOG_LEVEL_WARN, $($arg)*)
+  };
+}
+
+#[macro_export]
+macro_rules! info {
+  ($log:expr, $($arg:tt)*) => {
+    $crate::log!($log, SPA_LOG_LEVEL_INFO, $($arg)*)
+  };
+}
+
+#[macro_export]
+macro_rules! debug {
+  ($log:expr, $($arg:tt)*) => {
+    $crate::log!($log, SPA_LOG_LEVEL_DEBUG, $($arg)*)
+  };
+}
+
+#[macro_export]
+macro_rules! trace {
+  ($log:expr, $($arg:tt)*) => {
+    $crate::log!($log, SPA_LOG_LEVEL_TRACE, $($arg)*)
+  };
 }

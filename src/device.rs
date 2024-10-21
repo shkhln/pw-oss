@@ -180,10 +180,13 @@ unsafe extern "C" fn init(
   _factory:  *const spa_handle_factory,
   handle:    *mut   spa_handle,
   info:      *const spa_dict,
-  _support:  *const spa_support,
-  _n_support: u32
+  support:   *const spa_support,
+  n_support: u32
 ) -> c_int
 {
+  let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) as *mut spa_log;
+  let log = crate::spa::Log::wrap(log);
+
   let state = handle.cast::<State>().as_mut()
     .expect("handle is not supposed to be null");
 
@@ -211,14 +214,14 @@ unsafe extern "C" fn init(
   }
 
   if pcm_device_indexes.is_empty() {
-    eprintln!("{} should contain pcm device indexes", crate::keys::PCM_DEVICE_INDEXES);
+    crate::error!(log, "{} should contain pcm device indexes", crate::keys::PCM_DEVICE_INDEXES);
     return -libc::EINVAL;
   }
 
   let pcm_devices = crate::sound::list_pcm_devices(&pcm_device_indexes);
 
   if pcm_devices.is_empty() {
-    eprintln!("can't retrieve pcm device information");
+    crate::error!(log, "can't retrieve pcm device information");
     return -libc::EINVAL;
   }
 

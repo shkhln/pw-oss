@@ -13,7 +13,8 @@ struct State {
   hooks:       spa_hook_list,
   pcm_indexes: BTreeMap<String, Vec<u32>>,
   devd_socket: crate::utils::DevdSocket,
-  devd_source: spa_source
+  devd_source: spa_source,
+  log:         crate::spa::Log
 }
 
 fn emit_dev_node(hook: &spa_hook, events: &spa_device_events, driver: &str, indexes: &[u32]) {
@@ -136,7 +137,7 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
       if change.as_str() == "+" {
         state.pcm_indexes = crate::sound::group_pcm_devices_by_parent(&crate::sound::read_sndstat().unwrap());
         if let Some(indexes) = state.pcm_indexes.get(driver.as_str()) {
-          eprintln!("oss-monitor: registering {} ({:?})", driver.as_str(), indexes);
+          crate::info!(state.log, "registering {} ({:?})", driver.as_str(), indexes);
           crate::spa::for_each_hook(&mut state.hooks, |entry| {
             let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
               .expect("callback should be initialized");
@@ -145,7 +146,7 @@ unsafe extern "C" fn on_devd_event(source: *mut spa_source) {
           });
         }
       } else if let Some(indexes) = state.pcm_indexes.remove(driver.as_str()) {
-        eprintln!("oss-monitor: removing {} ({:?})", driver.as_str(), indexes);
+        crate::info!(state.log, "removing {} ({:?})", driver.as_str(), indexes);
         crate::spa::for_each_hook(&mut state.hooks, |entry| {
           let f = entry.cb.funcs.cast::<spa_device_events>().as_ref()
             .expect("callback should be initialized");
@@ -165,8 +166,10 @@ unsafe extern "C" fn init(
   n_support: u32
 ) -> c_int
 {
+  let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) as *mut spa_log;
+  let log = crate::spa::Log::wrap(log);
 
-  let main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop  .as_ptr().cast()) as *mut spa_loop;
+  let main_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop.as_ptr().cast()) as *mut spa_loop;
 
   if main_loop.is_null() {
     return -libc::EINVAL;
@@ -180,7 +183,7 @@ unsafe extern "C" fn init(
   let pcm_indexes = match crate::sound::read_sndstat() {
     Ok(indexes) => crate::sound::group_pcm_devices_by_parent(&indexes),
     Err(err)    => {
-      eprintln!("Can't open /dev/sndstat: {}", err);
+      crate::error!(log, "Can't open /dev/sndstat: {}", err);
       return -(err as c_int);
     }
   };
@@ -234,7 +237,9 @@ unsafe extern "C" fn init(
     pcm_indexes,
 
     devd_socket,
-    devd_source
+    devd_source,
+
+    log
   });
 
   spa_hook_list_init(&mut state.hooks);
