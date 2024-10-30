@@ -1,6 +1,6 @@
 use core::ffi::CStr;
 use std::ffi::CString;
-use std::os::raw::{c_int, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 use libspa::sys::*;
 
 pub const SPA_DEVICE_CHANGE_MASK_ALL: u32 =
@@ -68,7 +68,7 @@ pub unsafe fn dump_spa_dict(dict: &spa_dict) {
 
 pub enum DictionaryString {
   CString(CString),
-  Ptr(*const i8)
+  Ptr(*const c_char)
 }
 
 impl From<&str> for DictionaryString {
