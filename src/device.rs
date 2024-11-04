@@ -35,19 +35,20 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
 
     for device in &state.pcm_devices {
 
-      let mut dict = crate::spa::Dictionary::new();
-
-      dict.add_item(SPA_KEY_NODE_NAME.as_ptr(), format!("pcm{}", device.index));
-
-      if device.desc == state.description && !device.location.is_empty() {
-        dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), format!("{} @ {}", device.desc, device.location));
-      } else {
-        dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), device.desc.as_str());
-      }
-
-      dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
-
       if device.play {
+
+        let mut dict = crate::spa::Dictionary::new();
+
+        dict.add_item(SPA_KEY_NODE_NAME.as_ptr(), format!("pcm{}.play", device.index));
+
+        if device.desc == state.description && !device.location.is_empty() {
+          dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), format!("{} @ {}", device.desc, device.location));
+        } else {
+          dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), device.desc.as_str());
+        }
+
+        dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
+
         let obj_info = spa_device_object_info {
           version:      SPA_VERSION_DEVICE_OBJECT_INFO,
           type_:        SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
@@ -63,6 +64,19 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
       }
 
       if device.rec {
+
+        let mut dict = crate::spa::Dictionary::new();
+
+        dict.add_item(SPA_KEY_NODE_NAME.as_ptr(), format!("pcm{}.rec", device.index));
+
+        if device.desc == state.description && !device.location.is_empty() {
+          dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), format!("{} @ {}", device.desc, device.location));
+        } else {
+          dict.add_item(SPA_KEY_NODE_DESCRIPTION.as_ptr(), device.desc.as_str());
+        }
+
+        dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
+
         let obj_info = spa_device_object_info {
           version:      SPA_VERSION_DEVICE_OBJECT_INFO,
           type_:        SPA_TYPE_INTERFACE_Node.as_ptr().cast(),
