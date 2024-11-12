@@ -22,7 +22,11 @@ struct State {
   callbacks:    spa_callbacks,
   ports:        [Port; MAX_PORTS],
   started:      bool,
-  following:    bool
+  following:    bool,
+  missing_bufs: usize,
+  process_iter: usize,
+  timer_delay:  u64,
+  xrun_point:   Option<u64>
 }
 
 impl State {
@@ -36,7 +40,7 @@ struct Port {
   config:  Option<PortConfig>,
   buffers: Vec<*mut spa_buffer>,
   io:      *mut spa_io_buffers,
-  dsp:     crate::sound::Dsp
+  dsp:     crate::sound::DspWriter
 }
 
 pub struct PortConfig {
@@ -45,6 +49,22 @@ pub struct PortConfig {
   pub channels:  u32,
   pub positions: Vec<u32>
 }
+
+/*impl PortConfig {
+
+  fn bytes_per_ms(&self) -> f32 {
+
+    let bytes_per_sample = match self.format {
+      libspa::param::audio::AudioFormat::S32LE => 4,
+      libspa::param::audio::AudioFormat::S32BE => 4,
+      libspa::param::audio::AudioFormat::S16LE => 2,
+      libspa::param::audio::AudioFormat::S16BE => 2,
+      _ => unreachable!()
+    };
+
+    (self.rate * self.channels * bytes_per_sample) as f32 / 1000.0
+  }
+}*/
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
 
@@ -186,17 +206,31 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let duration = (*state.position).clock.target_duration;
   let rate     = (*state.position).clock.target_rate.denom;
 
+  #[cfg(debug_assertions)]
+  eprintln!("cycle: {}", (*state.position).clock.cycle);
+  let delay = crate::utils::now_ns() - nsec;
+  #[cfg(debug_assertions)]
+  eprintln!("delay: {} ms", delay as f64 / 1000000.0);
+  state.timer_delay = delay;
+
   state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
 
   assert!(!state.clock.is_null());
 
   (*state.clock).nsec      = nsec;
-  (*state.clock).rate      = (*state.clock).target_rate;
+  (*state.clock).rate      = (*state.clock).target_rate; // ?
   (*state.clock).position += (*state.clock).duration;
   (*state.clock).duration  = duration;
   (*state.clock).delay     = 0;
   (*state.clock).rate_diff = 1.0;
   (*state.clock).next_nsec = state.next_time;
+
+  if state.process_iter == 0 {
+    //crate::warn!(state.log, "Somebody missed the deadline?");
+    state.missing_bufs += 1;
+  }
+
+  state.process_iter = 0;
 
   let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
     .expect("callbacks should be initialized");
@@ -216,6 +250,10 @@ unsafe fn set_timeout(state: &mut State, next_time: u64) {
 
   #[cfg(debug_assertions)]
   crate::trace!(state.log, "set_timeout {}", next_time);
+
+  // some jitter
+  //let delay = (unsafe { libc::rand() } as f32 / libc::RAND_MAX as f32 * 70_000_000.0) as u64;
+  //let next_time = next_time + delay;
 
   let timerspec = itimerspec {
     it_value: timespec {
@@ -319,6 +357,11 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
 
       state.started   = true;
       state.following = state.node_is_follower();
+
+      state.missing_bufs = 0;
+      state.process_iter = 1234;
+      state.xrun_point   = None;
+
       let user_data = state as *mut _ as *mut c_void;
       let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
       0
@@ -526,8 +569,15 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     .expect("object is not supposed to be null");
 
   assert!(state.started);
+  state.process_iter += 1;
 
   let mut result = SPA_STATUS_OK as i32;
+
+  if state.process_iter > 1 {
+    // crate::warn!(state.log, "Hello there!");
+    assert!(state.missing_bufs > 0);
+    state.missing_bufs -= 1;
+  }
 
   for port in &mut state.ports {
 
@@ -560,11 +610,51 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size));
     }
 
-    let nbytes = port.dsp.write(data_0.data.offset(offset as isize), size);
-    assert_eq!(nbytes, size as isize);
+    if !port.dsp.is_running() {
+      port.dsp.set_buffer_size(size * 2 /* enough space to not overrun the buffer */ + size /* delay */);
+      #[cfg(debug_assertions)]
+      crate::warn!(state.log, "writing {} zeroes", size);
+      port.dsp.write_zeroes(size);
+    }
+
+    let underruns = port.dsp.underruns();
+    if underruns > 0 {
+      //TODO: should we report xrun to PipeWire somehow?
+      port.dsp.pause();
+      crate::warn!(state.log, "OSS reported {} underruns", underruns);
+      state.xrun_point = Some(crate::utils::now_ns());
+    }
+
+    let nbytes = if let Some(timestamp) = state.xrun_point {
+
+      let duration = (*state.position).clock.target_duration;
+      let rate     = (*state.position).clock.target_rate.denom;
+
+      if (*state.clock).nsec > timestamp && state.missing_bufs == 0 &&
+        state.timer_delay <= duration * SPA_NSEC_PER_SEC as u64 / rate as u64
+      {
+        state.xrun_point = None;
+        #[cfg(debug_assertions)]
+        crate::warn!(state.log, "writing {} zeroes", size);
+        port.dsp.write_zeroes(size);
+        port.dsp.resume();
+        port.dsp.write(data_0.data.offset(offset as isize), size)
+      } else {
+        #[cfg(debug_assertions)]
+        crate::warn!(state.log, "skipping buffer @ {} (vs {})", (*state.clock).nsec, timestamp);
+        size as isize
+      }
+    } else {
+      port.dsp.write(data_0.data.offset(offset as isize), size)
+    };
+
+    if nbytes < size as isize {
+      crate::warn!(state.log, "dropped {} bytes", if nbytes > 0 { size - nbytes as usize } else { size });
+    }
 
     (*port.io).status = SPA_STATUS_NEED_DATA as i32;
-    result |= SPA_STATUS_NEED_DATA as i32;
+
+    result |= SPA_STATUS_HAVE_DATA as i32; // those codes don't make any sense
   }
 
   result
@@ -755,10 +845,18 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path) }; MAX_PORTS],
+    ports: [
+      Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::DspWriter::new(&dsp_path) };
+      MAX_PORTS
+    ],
 
     started:   false,
-    following: false
+    following: false,
+
+    missing_bufs: 0,
+    process_iter: 0,
+    timer_delay:  0,
+    xrun_point:   None
   });
 
   state.node_info.fix_pointers();
