@@ -36,7 +36,7 @@ struct Port {
   config:  Option<PortConfig>,
   buffers: Vec<*mut spa_buffer>,
   io:      *mut spa_io_buffers,
-  dsp:     crate::sound::Dsp
+  dsp:     crate::sound::DspWriter
 }
 
 pub struct PortConfig {
@@ -186,6 +186,16 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let duration = (*state.position).clock.target_duration;
   let rate     = (*state.position).clock.target_rate.denom;
 
+  /*{
+    let mut now = timespec { tv_sec: 0, tv_nsec: 0 };
+    let err = state.data_system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+    assert!(err >= 0);
+
+    let now_ns = (now.tv_sec * SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64;
+    let delay = now_ns - nsec;
+    eprintln!("delay: {}", delay as f64 / 1000000.0);
+  }*/
+
   state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
 
   assert!(!state.clock.is_null());
@@ -216,6 +226,10 @@ unsafe fn set_timeout(state: &mut State, next_time: u64) {
 
   #[cfg(debug_assertions)]
   crate::trace!(state.log, "set_timeout {}", next_time);
+
+  // some jitter
+  //let delay = (unsafe { libc::rand() } as f32 / libc::RAND_MAX as f32 * 70_000_000.0) as u64;
+  //let next_time = next_time + delay;
 
   let timerspec = itimerspec {
     it_value: timespec {
@@ -560,11 +574,24 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size));
     }
 
-    let nbytes = port.dsp.write(data_0.data.offset(offset as isize), size);
-    assert_eq!(nbytes, size as isize);
+    // ?
+    if !port.dsp.is_running() {
+      let buf = [0u8; 131072];
+      port.dsp.write(buf.as_ptr().cast(), size.min(buf.len()));
+    }
+
+    port.dsp.write(data_0.data.offset(offset as isize), size);
+
+    let underruns = port.dsp.underruns();
+    if underruns > 0 {
+      crate::warn!(state.log, "OSS reported {} underruns", underruns);
+      //let buf = [0u8; 131072];
+      //port.dsp.write(buf.as_ptr().cast(), size.min(buf.len()));
+    }
 
     (*port.io).status = SPA_STATUS_NEED_DATA as i32;
-    result |= SPA_STATUS_NEED_DATA as i32;
+
+    result |= SPA_STATUS_HAVE_DATA as i32; // those codes don't make any sense
   }
 
   result
@@ -755,7 +782,10 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path) }; MAX_PORTS],
+    ports: [
+      Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::DspWriter::new(&dsp_path) };
+      MAX_PORTS
+    ],
 
     started:   false,
     following: false

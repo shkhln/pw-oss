@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::os::raw::{c_int, c_ulong, c_void};
+use std::os::raw::{c_int, c_long, c_uint, c_ulong, c_void};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use bbqueue::{BBBuffer, Consumer, Producer};
 use libc::{size_t, ssize_t};
 use nix::errno::Errno;
 
@@ -13,8 +16,11 @@ const SNDCTL_DSP_SPEED:      c_ulong = nix::request_code_readwrite!(b'P',  2, st
 const SNDCTL_DSP_SETFMT:     c_ulong = nix::request_code_readwrite!(b'P',  5, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_CHANNELS:   c_ulong = nix::request_code_readwrite!(b'P',  6, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETISPACE:  c_ulong = nix::request_code_read!     (b'P', 13, std::mem::size_of::<audio_buf_info>());
+const SNDCTL_DSP_GETOSPACE:  c_ulong = nix::request_code_read!     (b'P', 12, std::mem::size_of::<audio_buf_info>());
 //const SNDCTL_DSP_GETPLAYVOL: c_ulong = nix::request_code_read!     (b'P', 24, std::mem::size_of::<c_int>());
 //const SNDCTL_DSP_SETPLAYVOL: c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_GETODELAY:  c_ulong = nix::request_code_read!     (b'P', 23, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_GETERROR:   c_ulong = nix::request_code_read!     (b'P', 25, std::mem::size_of::<audio_errinfo>());
 
 #[repr(C)]
 struct audio_buf_info {
@@ -24,11 +30,73 @@ struct audio_buf_info {
   bytes:      c_int
 }
 
+#[repr(C)]
+struct audio_errinfo {
+  play_underruns:  c_int,
+  rec_overruns:    c_int,
+  play_ptradjust:  c_uint,
+  rec_ptradjust:   c_uint,
+  play_errorcount: c_int,
+  rec_errorcount:  c_int,
+  play_lasterror:  c_int,
+  rec_lasterror:   c_int,
+  play_errorparm:  c_long,
+  rec_errorparm:   c_long,
+  filler:          [c_int; 16]
+}
+
 #[derive(Debug, PartialEq)]
 enum DspState {
   Closed,
   Setup,
   Running
+}
+
+fn set_format(fd: c_int, format: u32) {
+  let mut f = format as c_int;
+  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFMT, &mut f) };
+  assert_ne!(err, -1);
+  assert_eq!(f, format as c_int);
+}
+
+fn set_channels(fd: c_int, channels: u32) {
+  let mut n = channels as c_int;
+  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_CHANNELS, &mut n) };
+  assert_ne!(err, -1);
+  assert_eq!(n, channels as c_int);
+}
+
+fn set_rate(fd: c_int, rate: u32) {
+  let mut n = rate as c_int;
+  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SPEED, &mut n) };
+  assert_ne!(err, -1);
+  assert_eq!(n, rate as c_int);
+}
+
+fn ospace_in_bytes(fd: c_int) -> c_int {
+  let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
+  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETOSPACE, info.as_mut_ptr()) };
+  if err != -1 {
+    unsafe { info.assume_init().bytes }
+  } else {
+    0
+  }
+}
+
+fn odelay(fd: c_int) -> c_int {
+  let mut delay: c_int = 4242;
+  let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_GETODELAY, &mut delay) };
+  assert_ne!(err, -1);
+  delay
+}
+
+fn get_error(fd: c_int) -> audio_errinfo {
+  let mut info = std::mem::MaybeUninit::<audio_errinfo>::uninit();
+  unsafe {
+    let err = libc::ioctl(fd, SNDCTL_DSP_GETERROR, info.as_mut_ptr());
+    assert_ne!(err, -1);
+    info.assume_init()
+  }
 }
 
 pub struct Dsp {
@@ -68,26 +136,17 @@ impl Dsp {
 
   pub fn set_format(&mut self, format: u32) {
     assert_eq!(self.state, DspState::Setup);
-    let mut f = format as c_int;
-    let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_SETFMT, &mut f) };
-    assert_ne!(err, -1);
-    assert_eq!(f, format as c_int);
+    set_format(self.fd, format);
   }
 
   pub fn set_channels(&mut self, channels: u32) {
     assert_eq!(self.state, DspState::Setup);
-    let mut n = channels as c_int;
-    let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_CHANNELS, &mut n) };
-    assert_ne!(err, -1);
-    assert_eq!(n, channels as c_int);
+    set_channels(self.fd, channels);
   }
 
   pub fn set_rate(&mut self, rate: u32) {
     assert_eq!(self.state, DspState::Setup);
-    let mut n = rate as c_int;
-    let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_SPEED, &mut n) };
-    assert_ne!(err, -1);
-    assert_eq!(n, rate as c_int);
+    set_rate(self.fd, rate);
   }
 
   pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
@@ -96,14 +155,6 @@ impl Dsp {
     }
     assert_eq!(self.state, DspState::Running);
     libc::read(self.fd, buf, count)
-  }
-
-  pub unsafe fn write(&mut self, buf: *const c_void, count: size_t) -> ssize_t {
-    if self.state == DspState::Setup {
-      self.state = DspState::Running;
-    }
-    assert_eq!(self.state, DspState::Running);
-    libc::write(self.fd, buf, count)
   }
 
   pub fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
@@ -138,11 +189,188 @@ impl Dsp {
   }
 }
 
-impl Drop for Dsp {
+const BUFFER_SIZE: usize = 131072;
+const MAX_BUFFERS: usize = 8;
+
+static BUFFERS: [BBBuffer<BUFFER_SIZE>; MAX_BUFFERS] = [const { BBBuffer::new() }; MAX_BUFFERS];
+static USED_BUFFERS: Mutex<[bool; MAX_BUFFERS]> = Mutex::new([false; 8]);
+
+fn grab_buffer() -> Option<usize> {
+  let mut used = USED_BUFFERS.lock().unwrap();
+  for i in 0..MAX_BUFFERS {
+    if !used[i] {
+      used[i] = true;
+      return Some(i);
+    }
+  }
+  None
+}
+
+fn return_buffer(index: usize) {
+  let mut used = USED_BUFFERS.lock().unwrap();
+  used[index] = false;
+}
+
+pub struct DspWriter {
+  path:    CString,
+  fd:      c_int,
+  buf_idx: Option<usize>,
+  prod:    Option<Producer<'static, BUFFER_SIZE>>,
+  io_thr:  Option<std::thread::JoinHandle<Consumer<'static, BUFFER_SIZE>>>,
+  closing: Arc<AtomicBool>,
+  state:   DspState
+}
+
+impl DspWriter {
+
+  pub fn new(path: &str) -> Self {
+    Self {
+      path:    CString::new(path).unwrap(),
+      fd:      -1,
+      buf_idx: None,
+      prod:    None,
+      io_thr:  None,
+      closing: Arc::new(AtomicBool::new(false)),
+      state:   DspState::Closed
+    }
+  }
+
+  pub fn is_closed(&self) -> bool {
+    self.state == DspState::Closed
+  }
+
+  pub fn is_running(&self) -> bool {
+    self.state == DspState::Running
+  }
+
+  pub fn open(&mut self) -> Result<(), Errno> {
+    let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_WRONLY) };
+    if fd == -1 {
+      return Err(Errno::last());
+    }
+
+    self.fd    = fd;
+    self.state = DspState::Setup;
+
+    self.buf_idx = grab_buffer();
+    let (mut prod, mut cons) = BUFFERS[self.buf_idx.unwrap()].try_split().unwrap();
+
+    if self.io_thr.is_none() {
+      let closing = self.closing.clone();
+      self.io_thr = Some(std::thread::spawn(move || {
+        loop {
+          if closing.load(Ordering::Relaxed) {
+            break;
+          }
+          match cons.read() {
+            Ok(rgr) => {
+              let len = rgr.buf().len();
+
+              let ospace = ospace_in_bytes(fd) as usize;
+              let odelay = odelay(fd);
+              eprintln!("count: {:5}, ospace: {:5}, odelay: {:5}", len, ospace, odelay);
+
+              let nbytes = unsafe { libc::write(fd, rgr.buf().as_ptr().cast(), len) };
+              rgr.release(usize::MAX);
+              if nbytes == -1 /*nbytes != len as isize*/ {
+                break;
+              }
+            },
+            Err(_) => {
+              std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+          }
+        }
+        cons
+      }));
+    }
+
+    self.prod = Some(prod);
+
+    Ok(())
+  }
+
+  pub fn close(&mut self) {
+    assert_ne!(self.state, DspState::Closed);
+
+    self.closing.store(true, Ordering::Relaxed);
+    if let Some(prod) = self.prod.take() {
+      if let Some(thr) = self.io_thr.take() {
+        let cons = thr.join().unwrap();
+        assert!(BUFFERS[self.buf_idx.unwrap()].try_release(prod, cons).is_ok());
+      }
+    }
+    self.closing.store(false, Ordering::Relaxed);
+
+    if let Some(index) = self.buf_idx.take() {
+      return_buffer(index);
+    }
+
+    unsafe { libc::close(self.fd) };
+    self.fd    = -1;
+    self.state = DspState::Closed;
+  }
+
+  pub fn set_format(&mut self, format: u32) {
+    assert_eq!(self.state, DspState::Setup);
+    set_format(self.fd, format);
+  }
+
+  pub fn set_channels(&mut self, channels: u32) {
+    assert_eq!(self.state, DspState::Setup);
+    set_channels(self.fd, channels);
+  }
+
+  pub fn set_rate(&mut self, rate: u32) {
+    assert_eq!(self.state, DspState::Setup);
+    set_rate(self.fd, rate);
+  }
+
+  unsafe fn write_async(&mut self, buf: *const c_void, count: size_t) {
+
+    if self.state == DspState::Setup {
+      self.state = DspState::Running;
+    }
+
+    assert_eq!(self.state, DspState::Running);
+
+    if let Some(prod) = &mut self.prod {
+      let mut wgr = prod.grant_exact(count).unwrap();
+      std::ptr::copy_nonoverlapping(buf as *mut u8, wgr.buf().as_ptr() as *mut u8, count);
+      wgr.commit(count);
+    }
+  }
+
+  unsafe fn write_sync(&mut self, buf: *const c_void, count: size_t) {
+    if self.state == DspState::Setup {
+      self.state = DspState::Running;
+    }
+    assert_eq!(self.state, DspState::Running);
+
+    let ospace = ospace_in_bytes(self.fd) as usize;
+    let odelay = odelay(self.fd);
+    eprintln!("count: {:5}, ospace: {:5}, odelay: {:5}", count, ospace, odelay);
+
+    let nbytes = libc::write(self.fd, buf, count);
+    assert_eq!(nbytes, count as isize);
+  }
+
+  pub unsafe fn write(&mut self, buf: *const c_void, count: size_t) {
+    self.write_async(buf, count);
+  }
+
+  pub fn underruns(&self) -> c_int {
+    assert_eq!(self.state, DspState::Running);
+    let info = get_error(self.fd);
+    info.play_underruns
+  }
+}
+
+impl Drop for DspWriter {
 
   fn drop(&mut self) {
-    if self.fd != -1 {
-      unsafe { libc::close(self.fd); }
+    if !self.is_closed() {
+      self.close();
     }
   }
 }
