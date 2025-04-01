@@ -205,7 +205,7 @@ impl Dsp {
 }
 
 pub struct DspWriter {
-  path:    CString,
+  pub path: String,
   fd:      c_int,
   state:   DspState,
   #[cfg(debug_assertions)]
@@ -218,9 +218,10 @@ impl DspWriter {
 
   pub fn new(path: &str) -> Self {
     Self {
-      path:    CString::new(path).unwrap(),
+      path:    path.to_string(),
       fd:      -1,
       state:   DspState::Closed,
+      #[cfg(debug_assertions)]
       prev_ns: 0
     }
   }
@@ -234,7 +235,8 @@ impl DspWriter {
   }
 
   pub fn open(&mut self) -> Result<(), Errno> {
-    let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+    let path = CString::new(self.path.clone()).unwrap();
+    let fd   = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
     if fd == -1 {
       return Err(Errno::last());
     }
@@ -289,8 +291,8 @@ impl DspWriter {
       let now_ns      = crate::utils::now_ns();
       let space_after = ospace_in_bytes(self.fd) as usize;
       let delay_after = odelay(self.fd);
-      eprintln!("{:9} count = {:5}, ospace = {:5} -> {:5}, odelay = {:5} -> {:5}",
-        now_ns - self.prev_ns, count, space, space_after, delay, delay_after);
+      eprintln!("{}: {:9} @ {} count = {:5}, ospace = {:5} -> {:5}, odelay = {:5} -> {:5}",
+        self.path, now_ns - self.prev_ns, now_ns, count, space, space_after, delay, delay_after);
       self.prev_ns = now_ns;
     }
 

@@ -23,8 +23,6 @@ struct State {
   ports:        [Port; MAX_PORTS],
   started:      bool,
   following:    bool,
-  missing_bufs: usize,
-  process_iter: usize,
   timer_delay:  u64,
   xrun_point:   Option<u64>
 }
@@ -208,9 +206,10 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   #[cfg(debug_assertions)]
   eprintln!("cycle: {}", (*state.position).clock.cycle);
-  let delay = crate::utils::now_ns() - nsec;
+  let now_ns = crate::utils::now_ns();
+  let delay  = now_ns - nsec;
   #[cfg(debug_assertions)]
-  eprintln!("delay: {} ms", delay as f64 / 1000000.0);
+  eprintln!("delay: {} ms @ {}", delay as f64 / 1000000.0, now_ns);
   state.timer_delay = delay;
 
   state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
@@ -224,13 +223,6 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   (*state.clock).delay     = 0;
   (*state.clock).rate_diff = 1.0;
   (*state.clock).next_nsec = state.next_time;
-
-  if state.process_iter == 0 {
-    //crate::warn!(state.log, "Somebody missed the deadline?");
-    state.missing_bufs += 1;
-  }
-
-  state.process_iter = 0;
 
   let node_callbacks = state.callbacks.funcs.cast::<spa_node_callbacks>().as_ref()
     .expect("callbacks should be initialized");
@@ -358,9 +350,7 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
       state.started   = true;
       state.following = state.node_is_follower();
 
-      state.missing_bufs = 0;
-      state.process_iter = 1234;
-      state.xrun_point   = None;
+      state.xrun_point = None;
 
       let user_data = state as *mut _ as *mut c_void;
       let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
@@ -569,15 +559,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     .expect("object is not supposed to be null");
 
   assert!(state.started);
-  state.process_iter += 1;
 
   let mut result = SPA_STATUS_OK as i32;
-
-  if state.process_iter > 1 {
-    // crate::warn!(state.log, "Hello there!");
-    assert!(state.missing_bufs > 0);
-    state.missing_bufs -= 1;
-  }
 
   for port in &mut state.ports {
 
@@ -613,16 +596,20 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     if !port.dsp.is_running() {
       port.dsp.set_buffer_size(size * 2 /* enough space to not overrun the buffer */ + size /* delay */);
       #[cfg(debug_assertions)]
-      crate::warn!(state.log, "writing {} zeroes", size);
+      crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, size);
       port.dsp.write_zeroes(size);
     }
 
     let underruns = port.dsp.underruns();
     if underruns > 0 {
       //TODO: should we report xrun to PipeWire somehow?
-      port.dsp.pause();
-      crate::warn!(state.log, "OSS reported {} underruns", underruns);
-      state.xrun_point = Some(crate::utils::now_ns());
+      //let duration = (*state.position).clock.duration;
+      //(*state.clock).xrun += (duration as f32 * (underruns as f32 / 36.0)) as u64;
+      //port.dsp.pause();
+      crate::warn!(state.log, "{}: OSS reported {} underruns @ {}", port.dsp.path, underruns, crate::utils::now_ns());
+      if state.xrun_point.is_none() {
+        state.xrun_point = Some(crate::utils::now_ns());
+      }
     }
 
     let nbytes = if let Some(timestamp) = state.xrun_point {
@@ -630,18 +617,19 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let duration = (*state.position).clock.target_duration;
       let rate     = (*state.position).clock.target_rate.denom;
 
-      if (*state.clock).nsec > timestamp && state.missing_bufs == 0 &&
+      if (*state.position).clock.nsec > timestamp &&
+        (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
         state.timer_delay <= duration * SPA_NSEC_PER_SEC as u64 / rate as u64
       {
         state.xrun_point = None;
         #[cfg(debug_assertions)]
-        crate::warn!(state.log, "writing {} zeroes", size);
+        crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, size);
         port.dsp.write_zeroes(size);
-        port.dsp.resume();
+        //port.dsp.resume(); //TODO: 4 ms?
         port.dsp.write(data_0.data.offset(offset as isize), size)
       } else {
         #[cfg(debug_assertions)]
-        crate::warn!(state.log, "skipping buffer @ {} (vs {})", (*state.clock).nsec, timestamp);
+        crate::warn!(state.log, "{}: skipping buffer @ {} (vs {})", port.dsp.path, (*state.position).clock.nsec, timestamp);
         size as isize
       }
     } else {
@@ -649,7 +637,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     };
 
     if nbytes < size as isize {
-      crate::warn!(state.log, "dropped {} bytes", if nbytes > 0 { size - nbytes as usize } else { size });
+      crate::warn!(state.log, "{}: dropped {} bytes", port.dsp.path, if nbytes > 0 { size - nbytes as usize } else { size });
     }
 
     (*port.io).status = SPA_STATUS_NEED_DATA as i32;
@@ -853,8 +841,6 @@ unsafe extern "C" fn init(
     started:   false,
     following: false,
 
-    missing_bufs: 0,
-    process_iter: 0,
     timer_delay:  0,
     xrun_point:   None
   });
