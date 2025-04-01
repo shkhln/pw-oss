@@ -288,12 +288,12 @@ impl DspWriter {
 
     #[cfg(debug_assertions)]
     {
-      let now_ns      = crate::utils::now_ns();
+      let now         = crate::utils::now_ns();
       let space_after = ospace_in_bytes(self.fd) as usize;
       let delay_after = odelay(self.fd);
       eprintln!("{}: {:9} @ {} count = {:5}, ospace = {:5} -> {:5}, odelay = {:5} -> {:5}",
-        self.path, now_ns - self.prev_ns, now_ns, count, space, space_after, delay, delay_after);
-      self.prev_ns = now_ns;
+        self.path, now - self.prev_ns, now, count, space, space_after, delay, delay_after);
+      self.prev_ns = now;
     }
 
     nbytes

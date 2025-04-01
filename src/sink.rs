@@ -23,8 +23,8 @@ struct State {
   ports:        [Port; MAX_PORTS],
   started:      bool,
   following:    bool,
-  timer_delay:  u64,
-  xrun_point:   Option<u64>
+  cur_proc_ts:  u64,
+  old_proc_ts:  u64
 }
 
 impl State {
@@ -38,7 +38,8 @@ struct Port {
   config:  Option<PortConfig>,
   buffers: Vec<*mut spa_buffer>,
   io:      *mut spa_io_buffers,
-  dsp:     crate::sound::DspWriter
+  dsp:     crate::sound::DspWriter,
+  xrun_ts: u64
 }
 
 pub struct PortConfig {
@@ -205,12 +206,12 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
   let rate     = (*state.position).clock.target_rate.denom;
 
   #[cfg(debug_assertions)]
-  eprintln!("cycle: {}", (*state.position).clock.cycle);
-  let now_ns = crate::utils::now_ns();
-  let delay  = now_ns - nsec;
-  #[cfg(debug_assertions)]
-  eprintln!("delay: {} ms @ {}", delay as f64 / 1000000.0, now_ns);
-  state.timer_delay = delay;
+  {
+    let now   = crate::utils::now_ns();
+    let delay = now - nsec;
+    eprintln!("cycle: {}", (*state.position).clock.cycle);
+    eprintln!("delay: {} ms @ {}", delay as f64 / 1000000.0, now);
+  }
 
   state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
 
@@ -350,7 +351,12 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
       state.started   = true;
       state.following = state.node_is_follower();
 
-      state.xrun_point = None;
+      for port in &mut state.ports {
+        port.xrun_ts = 0;
+      }
+
+      state.cur_proc_ts = 0;
+      state.old_proc_ts = 0;
 
       let user_data = state as *mut _ as *mut c_void;
       let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
@@ -560,6 +566,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
   assert!(state.started);
 
+  state.old_proc_ts = state.cur_proc_ts;
+  state.cur_proc_ts = crate::utils::now_ns();
+
   let mut result = SPA_STATUS_OK as i32;
 
   for port in &mut state.ports {
@@ -596,7 +605,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     if !port.dsp.is_running() {
       port.dsp.set_buffer_size(size * 2 /* enough space to not overrun the buffer */ + size /* delay */);
       #[cfg(debug_assertions)]
-      crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, size);
+      {
+        crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, size);
+      }
       port.dsp.write_zeroes(size);
     }
 
@@ -606,30 +617,39 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       //let duration = (*state.position).clock.duration;
       //(*state.clock).xrun += (duration as f32 * (underruns as f32 / 36.0)) as u64;
       //port.dsp.pause();
-      crate::warn!(state.log, "{}: OSS reported {} underruns @ {}", port.dsp.path, underruns, crate::utils::now_ns());
-      if state.xrun_point.is_none() {
-        state.xrun_point = Some(crate::utils::now_ns());
+      let now = crate::utils::now_ns();
+      crate::warn!(state.log, "{}: OSS reported {} underruns @ {}", port.dsp.path, underruns, now);
+      if port.xrun_ts == 0 {
+        port.xrun_ts = now;
       }
     }
 
-    let nbytes = if let Some(timestamp) = state.xrun_point {
+    let nbytes = if port.xrun_ts != 0 {
 
-      let duration = (*state.position).clock.target_duration;
-      let rate     = (*state.position).clock.target_rate.denom;
+      let clock  = (*state.position).clock;
+      let period = clock.target_duration * SPA_NSEC_PER_SEC as u64 / clock.target_rate.denom as u64;
+      let diff   = state.cur_proc_ts - state.old_proc_ts;
 
-      if (*state.position).clock.nsec > timestamp &&
-        (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
-        state.timer_delay <= duration * SPA_NSEC_PER_SEC as u64 / rate as u64
+      if clock.nsec > port.xrun_ts && clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
+        diff >= period && diff < period * 2
       {
-        state.xrun_point = None;
         #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, size);
+        {
+          crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, size);
+        }
         port.dsp.write_zeroes(size);
-        //port.dsp.resume(); //TODO: 4 ms?
-        port.dsp.write(data_0.data.offset(offset as isize), size)
+
+        let nbytes = port.dsp.write(data_0.data.offset(offset as isize), size);
+
+        //port.dsp.resume(); // adds 4 ms
+        port.xrun_ts = 0;
+
+        nbytes
       } else {
         #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: skipping buffer @ {} (vs {})", port.dsp.path, (*state.position).clock.nsec, timestamp);
+        {
+          crate::warn!(state.log, "{}: skipping buffer @ {} (vs {})", port.dsp.path, clock.nsec, port.xrun_ts);
+        }
         size as isize
       }
     } else {
@@ -834,15 +854,15 @@ unsafe extern "C" fn init(
     },
 
     ports: [
-      Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::DspWriter::new(&dsp_path) };
+      Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::DspWriter::new(&dsp_path), xrun_ts: 0 };
       MAX_PORTS
     ],
 
     started:   false,
     following: false,
 
-    timer_delay:  0,
-    xrun_point:   None
+    cur_proc_ts: 0,
+    old_proc_ts: 0
   });
 
   state.node_info.fix_pointers();
