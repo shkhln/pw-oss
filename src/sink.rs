@@ -24,7 +24,8 @@ struct State {
   started:      bool,
   following:    bool,
   cur_proc_ts:  u64,
-  old_proc_ts:  u64
+  old_proc_ts:  u64,
+  oss_delay:    usize // additional delay in 1/8ths of period
 }
 
 impl State {
@@ -150,7 +151,10 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   0
 }*/
 
-unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+
+  let state = object.cast::<State>().as_mut()
+    .expect("object is not supposed to be null");
 
   use libspa::pod::{Value, Object, Pod};
   use libspa::pod::deserialize::PodDeserializer;
@@ -173,7 +177,22 @@ unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param
               SPA_PROP_monitorVolumes => (), // ditto
               SPA_PROP_softMute       => (), // ditto
               SPA_PROP_softVolumes    => (), // ditto
-              SPA_PROP_params         => (), // ditto
+              SPA_PROP_params         => {
+                match property.value {
+                  Value::Struct(values) if values.len() % 2 == 0 => {
+                    for kv in values.chunks(2) {
+                      match (&kv[0], &kv[1]) {
+                        // pw-cli set-param <object-id> Props '{ "params": ["oss.delay", 8]}'
+                        (Value::String(s), Value::Int(x)) if s == "oss.delay" && *x >= 0 => {
+                          state.oss_delay = *x as usize;
+                        },
+                        _ => ()
+                      }
+                    }
+                  }
+                  _ => ()
+                }
+              },
               _ => unimplemented!()
             }
           }
@@ -202,16 +221,15 @@ unsafe extern "C" fn on_timeout(source: *mut spa_source) {
 
   assert!(!state.position.is_null());
 
-  let duration = (*state.position).clock.target_duration;
-  let rate     = (*state.position).clock.target_rate.denom;
-
   #[cfg(debug_assertions)]
   {
     let now   = crate::utils::now_ns();
     let delay = now - nsec;
-    eprintln!("cycle: {}", (*state.position).clock.cycle);
-    eprintln!("delay: {} ms @ {}", delay as f64 / 1000000.0, now);
+    eprintln!("cycle: {}, delay: {} ms @ {}", (*state.position).clock.cycle, delay as f64 / 1000000.0, now);
   }
+
+  let duration = (*state.position).clock.target_duration;
+  let rate     = (*state.position).clock.target_rate.denom;
 
   state.next_time = nsec + duration * SPA_NSEC_PER_SEC as u64 / rate as u64;
 
@@ -244,10 +262,6 @@ unsafe fn set_timeout(state: &mut State, next_time: u64) {
   #[cfg(debug_assertions)]
   crate::trace!(state.log, "set_timeout {}", next_time);
 
-  // some jitter
-  //let delay = (unsafe { libc::rand() } as f32 / libc::RAND_MAX as f32 * 70_000_000.0) as u64;
-  //let next_time = next_time + delay;
-
   let timerspec = itimerspec {
     it_value: timespec {
       tv_sec:  (next_time / SPA_NSEC_PER_SEC as u64) as i64,
@@ -268,13 +282,8 @@ unsafe extern "C" fn set_timers(loop_: *mut spa_loop, async_: bool, seq: u32, da
   #[cfg(debug_assertions)]
   crate::trace!(state.log, "set_timers");
 
-  let mut now = timespec { tv_sec: 0, tv_nsec: 0 };
-  let err = state.data_system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
-  assert!(err >= 0);
-
-  state.next_time = (now.tv_sec * SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64;
-
   if state.started && !state.following {
+    state.next_time = crate::utils::now_ns();
     #[cfg(debug_assertions)]
     crate::trace!(state.log, "next time {}", state.next_time);
     set_timeout(state, state.next_time);
@@ -603,24 +612,20 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     }
 
     if !port.dsp.is_running() {
-      port.dsp.set_buffer_size(size * 2 /* enough space to not overrun the buffer */ + size /* delay */);
+      let odelay = size / 8 * state.oss_delay;
+      port.dsp.set_buffer_size(size * 2 /* enough space to not overrun the buffer */ + odelay /* delay */);
       #[cfg(debug_assertions)]
       {
-        crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, size);
+        crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, odelay);
       }
-      port.dsp.write_zeroes(size);
+      port.dsp.write_zeroes(odelay);
     }
 
     let underruns = port.dsp.underruns();
     if underruns > 0 {
-      //TODO: should we report xrun to PipeWire somehow?
-      //let duration = (*state.position).clock.duration;
-      //(*state.clock).xrun += (duration as f32 * (underruns as f32 / 36.0)) as u64;
-      //port.dsp.pause();
-      let now = crate::utils::now_ns();
-      crate::warn!(state.log, "{}: OSS reported {} underruns @ {}", port.dsp.path, underruns, now);
+      crate::warn!(state.log, "{}: OSS reported {} underruns @ {}", port.dsp.path, underruns, state.cur_proc_ts);
       if port.xrun_ts == 0 {
-        port.xrun_ts = now;
+        port.xrun_ts = state.cur_proc_ts;
       }
     }
 
@@ -628,23 +633,22 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
       let clock  = (*state.position).clock;
       let period = clock.target_duration * SPA_NSEC_PER_SEC as u64 / clock.target_rate.denom as u64;
-      let diff   = state.cur_proc_ts - state.old_proc_ts;
+      let diff = state.cur_proc_ts - state.old_proc_ts;
 
+      (*state.clock).xrun += diff; // not sure if that does anything of value
+
+      // we are going to wait for the appropriate conditions to resume playback
       if clock.nsec > port.xrun_ts && clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
-        diff >= period && diff < period * 2
+        diff >= period && diff < period + 1_000_000 /* ? */
       {
+        port.xrun_ts = 0;
+        let odelay = size / 8 * state.oss_delay;
         #[cfg(debug_assertions)]
         {
-          crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, size);
+          crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, odelay);
         }
-        port.dsp.write_zeroes(size);
-
-        let nbytes = port.dsp.write(data_0.data.offset(offset as isize), size);
-
-        //port.dsp.resume(); // adds 4 ms
-        port.xrun_ts = 0;
-
-        nbytes
+        port.dsp.write_zeroes(odelay);
+        port.dsp.write(data_0.data.offset(offset as isize), size)
       } else {
         #[cfg(debug_assertions)]
         {
@@ -862,7 +866,9 @@ unsafe extern "C" fn init(
     following: false,
 
     cur_proc_ts: 0,
-    old_proc_ts: 0
+    old_proc_ts: 0,
+
+    oss_delay: 10
   });
 
   state.node_info.fix_pointers();

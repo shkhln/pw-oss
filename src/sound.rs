@@ -15,9 +15,9 @@ const SNDCTL_DSP_CHANNELS:    c_ulong = nix::request_code_readwrite!(b'P',  6, s
 const SNDCTL_DSP_SETFRAGMENT: c_ulong = nix::request_code_readwrite!(b'P', 10, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETOSPACE:   c_ulong = nix::request_code_read!     (b'P', 12, std::mem::size_of::<audio_buf_info>());
 const SNDCTL_DSP_GETISPACE:   c_ulong = nix::request_code_read!     (b'P', 13, std::mem::size_of::<audio_buf_info>());
-const SNDCTL_DSP_SETTRIGGER:  c_ulong = nix::request_code_write!    (b'P', 16, std::mem::size_of::<c_int>());
-//const SNDCTL_DSP_GETPLAYVOL: c_ulong = nix::request_code_read!     (b'P', 24, std::mem::size_of::<c_int>());
-//const SNDCTL_DSP_SETPLAYVOL: c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
+//const SNDCTL_DSP_SETTRIGGER:  c_ulong = nix::request_code_write!    (b'P', 16, std::mem::size_of::<c_int>());
+//const SNDCTL_DSP_GETPLAYVOL:  c_ulong = nix::request_code_read!     (b'P', 24, std::mem::size_of::<c_int>());
+//const SNDCTL_DSP_SETPLAYVOL:  c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETODELAY:   c_ulong = nix::request_code_read!     (b'P', 23, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETERROR:    c_ulong = nix::request_code_read!     (b'P', 25, std::mem::size_of::<audio_errinfo>());
 
@@ -88,15 +88,16 @@ fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
   let mut s = ((n_frags as u32) << 16) | frag_size_selector as u32;
   let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &mut s) };
   assert_ne!(err, -1);
-  //assert_eq!(s, ((n_frags as u32) << 16) | frag_size_selector as u32);
+  let out_len = ((s & 0xFFFF0000) >> 16) * (2u32 << (s & 0x0000FFFF));
+  assert!(out_len >= n_frags as u32 * (2u32 << frag_size_selector));
 }
 
-fn set_trigger(fd: c_int, mask: c_int) {
+/*fn set_trigger(fd: c_int, mask: c_int) {
   let mut m = mask as c_int;
   let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETTRIGGER, &mut m) };
   assert_ne!(err, -1);
   assert_eq!(m, mask as c_int);
-}
+}*/
 
 fn odelay(fd: c_int) -> c_int {
   let mut delay: c_int = -1;
@@ -267,10 +268,10 @@ impl DspWriter {
     set_rate(self.fd, rate);
   }
 
+  //TODO: check size?
   pub fn set_buffer_size(&mut self, len: usize) {
     assert_eq!(self.state, DspState::Setup);
     set_fragment(self.fd, (len as f32 / 1024.0).ceil() as u16, 10);
-    //TODO: check size?
   }
 
   pub unsafe fn write(&mut self, buf: *const c_void, count: size_t) -> ssize_t {
@@ -312,15 +313,15 @@ impl DspWriter {
     xruns as u32
   }
 
-  pub fn pause(&self) {
+  /*pub fn pause(&self) {
     assert_eq!(self.state, DspState::Running);
     set_trigger(self.fd, 0);
-  }
+  }*/
 
-  pub fn resume(&self) {
+  /*pub fn resume(&self) {
     assert_eq!(self.state, DspState::Running);
     set_trigger(self.fd, PCM_ENABLE_OUTPUT);
-  }
+  }*/
 }
 
 impl Drop for DspWriter {
