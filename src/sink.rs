@@ -23,8 +23,8 @@ struct State {
   ports:        [Port; MAX_PORTS],
   started:      bool,
   following:    bool,
-  cur_proc_ts:  u64,
-  old_proc_ts:  u64,
+  cur_proc_ts:  u64,  // method invocation timestamp for `process`
+  old_proc_ts:  u64,  // previous timestamp
   oss_delay:    usize // additional delay in 1/8ths of period
 }
 
@@ -40,7 +40,7 @@ struct Port {
   buffers: Vec<*mut spa_buffer>,
   io:      *mut spa_io_buffers,
   dsp:     crate::sound::DspWriter,
-  xrun_ts: u64
+  xrun_ts: u64 // approximate underrun timestamp
 }
 
 pub struct PortConfig {
@@ -321,6 +321,11 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
       //TODO: do we just ignore the result of this function?
       let user_data = state as *mut _ as *mut c_void;
       let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
+
+      // there are some weird xruns on clock changes messing our OSS buffer delay
+      for port in &mut state.ports {
+        port.xrun_ts = crate::utils::now_ns();
+      }
     }
   }
 
@@ -633,7 +638,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
       let clock  = (*state.position).clock;
       let period = clock.target_duration * SPA_NSEC_PER_SEC as u64 / clock.target_rate.denom as u64;
-      let diff = state.cur_proc_ts - state.old_proc_ts;
+      let diff   = state.cur_proc_ts - state.old_proc_ts;
 
       (*state.clock).xrun += diff; // not sure if that does anything of value
 
