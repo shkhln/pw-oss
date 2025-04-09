@@ -145,7 +145,15 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono
   Ok(())
 }
 
-pub fn now_ns() -> u64 {
+pub fn now_ns(system: &crate::spa::System) -> u64 {
+  let mut now = libspa::sys::timespec { tv_sec: 0, tv_nsec: 0 };
+  let err = unsafe { system.clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+  assert!(err != -1);
+  (now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64
+}
+
+#[cfg(debug_assertions)]
+pub fn now_ns_libc() -> u64 {
   let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
   let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
   assert!(err != -1);

@@ -289,10 +289,10 @@ impl DspWriter {
 
     #[cfg(debug_assertions)]
     {
-      let now         = crate::utils::now_ns();
+      let now         = crate::utils::now_ns_libc();
       let space_after = ospace_in_bytes(self.fd) as usize;
       let delay_after = odelay(self.fd);
-      eprintln!("{}: {:9} @ {} count = {:5}, ospace = {:5} -> {:5}, odelay = {:5} -> {:5}",
+      eprintln!("{}: {:9} @ {}, count = {:5}, ospace = {:5} -> {:5}, odelay = {:5} -> {:5}",
         self.path, now - self.prev_ns, now, count, space, space_after, delay, delay_after);
       self.prev_ns = now;
     }
@@ -308,9 +308,9 @@ impl DspWriter {
 
   pub fn underruns(&self) -> u32 {
     assert_eq!(self.state, DspState::Running);
-    let xruns = get_error(self.fd).play_underruns;
-    assert!(xruns >= 0);
-    xruns as u32
+    let uruns = get_error(self.fd).play_underruns;
+    assert!(uruns >= 0);
+    uruns as u32
   }
 
   /*pub fn pause(&self) {
