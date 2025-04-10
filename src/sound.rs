@@ -270,7 +270,8 @@ impl DspWriter {
 
   pub fn set_buffer_size(&mut self, len: usize) {
     assert_eq!(self.state, DspState::Setup);
-    set_fragment(self.fd, (len as f32 / 1024.0).ceil() as u16, 10);
+    assert!(len <= ZEROES.len());
+    set_fragment(self.fd, len.div_ceil(1024) as u16, 10);
   }
 
   pub unsafe fn write(&mut self, buf: *const c_void, count: size_t) -> ssize_t {
