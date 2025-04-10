@@ -326,6 +326,8 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
       // we'll just preemptively treat them as OSS underruns for now
       for port in &mut state.ports {
         port.xrun_timestamp = crate::utils::now_ns(&state.data_system);
+        #[cfg(debug_assertions)]
+        crate::warn!(state.log, "{}: clock change @ {}", port.dsp.path, port.xrun_timestamp);
       }
     }
   }
@@ -620,15 +622,17 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     if !port.dsp.is_running() {
       let target_delay_in_bytes = size / 8 * state.oss_delay;
       port.dsp.set_buffer_size(size * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
+
       #[cfg(debug_assertions)]
-      {
-        crate::warn!(state.log, "{}: writing initial {} zeroes", port.dsp.path, target_delay_in_bytes);
-      }
-      // there is a slight delay on playback start, so the overall buffer delay is a bit higher than expected
+      crate::warn!(state.log, "{}: writing initial {} zeroes", port.dsp.path, target_delay_in_bytes);
+
+      // there might be a slight delay on playback start,
+      // making the overall buffer delay a bit higher than expected
       port.dsp.write_zeroes(target_delay_in_bytes);
     } else {
       let underrun_count = port.dsp.underruns();
       if underrun_count > 0 {
+        //TODO: spa_node_call_xrun?
         crate::warn!(state.log, "{}: OSS reported {} underruns @ {}", port.dsp.path, underrun_count, state.cur_timestamp);
         if port.xrun_timestamp == 0 {
           port.xrun_timestamp = state.cur_timestamp;
@@ -647,25 +651,28 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let period = clock.target_duration * SPA_NSEC_PER_SEC as u64 / clock.target_rate.denom as u64;
       let diff   = state.cur_timestamp - state.old_timestamp;
 
-      (*state.clock).xrun += diff; // not sure if that does anything of value
+      // not sure if that does anything of value
+      /*if !state.clock.is_null() {
+        (*state.clock).xrun += diff;
+      }*/
 
       // we are going to wait for the appropriate conditions to continue normal playback
       if clock.nsec > port.xrun_timestamp && clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
         diff >= period && diff < period + 1_000_000 /* ? */
       {
         port.xrun_timestamp = 0;
+
         let target_delay_in_bytes = size / 8 * state.oss_delay;
+
         #[cfg(debug_assertions)]
-        {
-          crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, target_delay_in_bytes);
-        }
+        crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, target_delay_in_bytes);
+
         port.dsp.write_zeroes(target_delay_in_bytes);
         port.dsp.write(data_0.data.offset(offset as isize), size)
       } else {
         #[cfg(debug_assertions)]
-        {
-          crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, clock.nsec);
-        }
+        crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, clock.nsec);
+
         size as isize
       }
     } else {
@@ -880,7 +887,7 @@ unsafe extern "C" fn init(
     cur_timestamp: 0,
     old_timestamp: 0,
 
-    oss_delay: 10 // as chosen by an unfair and subjective process without due diligence or attention to details
+    oss_delay: 10 // eh, whatever
   });
 
   state.node_info.fix_pointers();

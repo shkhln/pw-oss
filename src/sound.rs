@@ -268,7 +268,6 @@ impl DspWriter {
     set_rate(self.fd, rate);
   }
 
-  //TODO: check size?
   pub fn set_buffer_size(&mut self, len: usize) {
     assert_eq!(self.state, DspState::Setup);
     set_fragment(self.fd, (len as f32 / 1024.0).ceil() as u16, 10);
