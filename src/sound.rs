@@ -268,13 +268,13 @@ impl DspWriter {
     set_rate(self.fd, rate);
   }
 
-  pub fn set_buffer_size(&mut self, len: usize) {
+  pub fn set_buffer_size(&mut self, len: u32) {
     assert_eq!(self.state, DspState::Setup);
-    assert!(len <= ZEROES.len());
+    assert!(len <= ZEROES.len() as u32);
     set_fragment(self.fd, len.div_ceil(1024) as u16, 10);
   }
 
-  pub unsafe fn write(&mut self, buf: *const c_void, count: size_t) -> ssize_t {
+  pub unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
     if self.state == DspState::Setup {
       self.state = DspState::Running;
     }
@@ -285,7 +285,7 @@ impl DspWriter {
     #[cfg(debug_assertions)]
     let delay = odelay(self.fd);
 
-    let nbytes = libc::write(self.fd, buf, count);
+    let nbytes = libc::write(self.fd, buf, count as size_t);
 
     #[cfg(debug_assertions)]
     {
@@ -300,10 +300,17 @@ impl DspWriter {
     nbytes
   }
 
-  pub fn write_zeroes(&mut self, count: usize) {
-    assert!(count <= ZEROES.len());
+  pub fn write_zeroes(&mut self, count: u32) {
+    assert!(count <= ZEROES.len() as u32);
     let nbytes = unsafe { self.write(ZEROES.as_ptr().cast(), count) };
     assert_eq!(nbytes, count as isize);
+  }
+
+  pub fn odelay(&self) -> u32 {
+    assert_eq!(self.state, DspState::Running);
+    let odelay = odelay(self.fd);
+    assert!(odelay >= 0);
+    odelay as u32
   }
 
   pub fn underruns(&self) -> u32 {

@@ -16,6 +16,7 @@ struct State {
   log:           crate::spa::Log,
   clock:         *mut spa_io_clock,
   position:      *mut spa_io_position,
+  rate_match:    *mut spa_io_rate_match,
   timer_source:  spa_source,
   next_time:     u64,
   hooks:         spa_hook_list,
@@ -25,7 +26,7 @@ struct State {
   following:     bool,
   cur_timestamp: u64,  // method invocation timestamp for `process`
   old_timestamp: u64,
-  oss_delay:     usize // additional delay in 1/8ths of period
+  oss_delay:     u32 // additional delay in 1/8ths of period
 }
 
 impl State {
@@ -40,7 +41,8 @@ struct Port {
   buffers:        Vec<*mut spa_buffer>,
   io:             *mut spa_io_buffers,
   dsp:            crate::sound::DspWriter,
-  xrun_timestamp: u64 // the moment we noticed an underrun (which is a bit later than the start of it)
+  xrun_timestamp: u64, // the moment we noticed an underrun (which is a bit later than the start of it)
+  dll:            crate::dll::SpaDLL
 }
 
 pub struct PortConfig {
@@ -50,21 +52,22 @@ pub struct PortConfig {
   pub positions: Vec<u32>
 }
 
-/*impl PortConfig {
+impl PortConfig {
 
-  fn bytes_per_ms(&self) -> f32 {
-
-    let bytes_per_sample = match self.format {
+  fn bytes_per_sample(&self) -> u32 {
+    match self.format {
       libspa::param::audio::AudioFormat::S32LE => 4,
       libspa::param::audio::AudioFormat::S32BE => 4,
       libspa::param::audio::AudioFormat::S16LE => 2,
       libspa::param::audio::AudioFormat::S16BE => 2,
       _ => unreachable!()
-    };
-
-    (self.rate * self.channels * bytes_per_sample) as f32 / 1000.0
+    }
   }
-}*/
+
+  fn stride(&self) -> u32 {
+    self.bytes_per_sample() * self.channels
+  }
+}
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
 
@@ -184,7 +187,7 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
                       match (&kv[0], &kv[1]) {
                         // pw-cli set-param <object-id> Props '{ "params": ["oss.delay", 8]}'
                         (Value::String(s), Value::Int(x)) if s == "oss.delay" && *x >= 0 => {
-                          state.oss_delay = *x as usize;
+                          state.oss_delay = *x as u32;
                         },
                         _ => ()
                       }
@@ -362,15 +365,13 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
           port.dsp.set_format(format);
           port.dsp.set_channels(config.channels);
           port.dsp.set_rate(config.rate);
+
+          port.xrun_timestamp = 0;
         }
       }
 
       state.started   = true;
       state.following = state.node_is_follower();
-
-      for port in &mut state.ports {
-        port.xrun_timestamp = 0;
-      }
 
       state.cur_timestamp = 0;
       state.old_timestamp = 0;
@@ -594,6 +595,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       continue;
     }
 
+    let port_config = port.config.as_ref().unwrap();
+
     assert!(!port.buffers.is_empty());
     assert!(!port.io.is_null());
 
@@ -611,17 +614,32 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     assert_eq!(data_0.type_, SPA_DATA_MemPtr);
 
     let offset = (*data_0.chunk).offset % data_0.maxsize; //TODO: should this be `(*data_0.chunk).offset.min(data_0.maxsize)` instead?
-    let size   = (*data_0.chunk).size.min(data_0.maxsize - offset) as libc::size_t;
+    let size   = (*data_0.chunk).size.min(data_0.maxsize - offset);
+
+    debug_assert_eq!((*data_0.chunk).stride, port_config.stride() as i32);
+
+    #[cfg(debug_assertions)]
+    if (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0 {
+      crate::warn!(state.log, "{}: SPA_IO_CLOCK_FLAG_XRUN_RECOVER @ {}", port.dsp.path, state.cur_timestamp);
+    }
 
     #[cfg(debug_assertions)]
     if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {
       crate::trace!(state.log, "offset: {}, chunk size: {}", offset, size);
-      spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size));
+      spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size) as usize);
     }
 
+    let driver_clock = (*state.position).clock;
+
     if !port.dsp.is_running() {
-      let target_delay_in_bytes = size / 8 * state.oss_delay;
-      port.dsp.set_buffer_size(size * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
+
+      let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
+      let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+
+      port.dll.init();
+      port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes as u32, driver_clock.target_rate.denom * port_config.stride());
+
+      port.dsp.set_buffer_size(period_in_bytes * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
 
       #[cfg(debug_assertions)]
       crate::warn!(state.log, "{}: writing initial {} zeroes", port.dsp.path, target_delay_in_bytes);
@@ -640,15 +658,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }
     }
 
-    #[cfg(debug_assertions)]
-    if (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0 {
-      crate::warn!(state.log, "{}: SPA_IO_CLOCK_FLAG_XRUN_RECOVER @ {}", port.dsp.path, state.cur_timestamp);
-    }
-
     let nbytes = if port.xrun_timestamp != 0 {
 
-      let clock  = (*state.position).clock;
-      let period = clock.target_duration * SPA_NSEC_PER_SEC as u64 / clock.target_rate.denom as u64;
+      let period = driver_clock.target_duration * SPA_NSEC_PER_SEC as u64 / driver_clock.target_rate.denom as u64;
       let diff   = state.cur_timestamp - state.old_timestamp;
 
       // not sure if that does anything of value
@@ -657,30 +669,51 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }*/
 
       // we are going to wait for the appropriate conditions to continue normal playback
-      if clock.nsec > port.xrun_timestamp && clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
+      if driver_clock.nsec > port.xrun_timestamp && driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
         diff >= period && diff < period + 1_000_000 /* ? */
       {
         port.xrun_timestamp = 0;
 
-        let target_delay_in_bytes = size / 8 * state.oss_delay;
+        let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
+        let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+
+        port.dll.init();
+        port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
 
         #[cfg(debug_assertions)]
         crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, target_delay_in_bytes);
 
         port.dsp.write_zeroes(target_delay_in_bytes);
-        port.dsp.write(data_0.data.offset(offset as isize), size)
+        port.dsp.write(data_0.data.offset(offset as isize), period_in_bytes)
       } else {
         #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, clock.nsec);
+        crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, driver_clock.nsec);
 
         size as isize
       }
     } else {
+      // PipeWire's ALSA DLL usage is quite a bit more elaborate than this. Should we do something about it?
+      if !state.rate_match.is_null() {
+
+        let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
+        let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+
+        let err  = (port.dsp.odelay() as isize - target_delay_in_bytes as isize) as f64;
+        let corr = port.dll.update(err /*.clamp(-((period_in_bytes / 8) as f64), (period_in_bytes / 8) as f64)*/);
+
+        #[cfg(debug_assertions)]
+        eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err);
+
+        (*state.rate_match).rate = corr.clamp(0.99, 1.01);
+
+        //TODO: assign state.clock.delay and state.clock.rate_diff?
+      }
+
       port.dsp.write(data_0.data.offset(offset as isize), size)
     };
 
     if nbytes < size as isize {
-      crate::warn!(state.log, "{}: dropped {} bytes", port.dsp.path, if nbytes > 0 { size - nbytes as usize } else { size });
+      crate::warn!(state.log, "{}: dropped {} bytes", port.dsp.path, if nbytes > 0 { size - nbytes as u32 } else { size });
     }
 
     (*port.io).status = SPA_STATUS_NEED_DATA as i32;
@@ -721,14 +754,19 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
   #[allow(non_upper_case_globals)]
   match id {
     SPA_IO_Buffers => {
-      if !data.is_null() {
-        state.ports[port_id as usize].io = data.cast();
-      } else {
-        state.ports[port_id as usize].io = std::ptr::null_mut();
-      }
+      state.ports[port_id as usize].io = data.cast();
       0
     },
-    SPA_IO_RateMatch => 0,
+    // you'd think that would be a node parameter instead
+    SPA_IO_RateMatch => {
+      let rate_match = data as *mut spa_io_rate_match;
+      if !rate_match.is_null() {
+        assert_eq!(MAX_PORTS, 1); // the code assumes a single port
+        (*rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+      }
+      state.rate_match = rate_match;
+      0
+    },
     _ => unimplemented!()
   }
 }
@@ -849,8 +887,9 @@ unsafe extern "C" fn init(
     data_system,
     log,
 
-    clock:    std::ptr::null_mut(),
-    position: std::ptr::null_mut(),
+    clock:      std::ptr::null_mut(),
+    position:   std::ptr::null_mut(),
+    rate_match: std::ptr::null_mut(),
 
     timer_source: spa_source {
       loop_: std::ptr::null_mut(),
@@ -877,7 +916,14 @@ unsafe extern "C" fn init(
     },
 
     ports: [
-      Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::DspWriter::new(&dsp_path), xrun_timestamp: 0 };
+      Port {
+        config:         None,
+        buffers:        vec![],
+        io:             std::ptr::null_mut(),
+        dsp:            crate::sound::DspWriter::new(&dsp_path),
+        xrun_timestamp: 0,
+        dll:            std::default::Default::default()
+      };
       MAX_PORTS
     ],
 
@@ -893,7 +939,7 @@ unsafe extern "C" fn init(
   state.node_info.fix_pointers();
 
   state.node_info.set_max_input_ports(1);
-  state.node_info.set_flags(SPA_NODE_FLAG_RT as u64);
+  state.node_info.set_flags(SPA_NODE_FLAG_RT as u64); // ?
 
   state.node_info.add_prop(SPA_KEY_MEDIA_CLASS.as_ptr(), "Audio/Sink");
   state.node_info.add_prop(SPA_KEY_NODE_DRIVER.as_ptr(), "true");
