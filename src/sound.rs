@@ -306,6 +306,13 @@ impl DspWriter {
     assert_eq!(nbytes, count as isize);
   }
 
+  pub fn odelay(&self) -> u32 {
+    assert_eq!(self.state, DspState::Running);
+    let odelay = odelay(self.fd);
+    assert!(odelay >= 0);
+    odelay as u32
+  }
+
   pub fn underruns(&self) -> u32 {
     assert_eq!(self.state, DspState::Running);
     let uruns = get_error(self.fd).play_underruns;

@@ -12,6 +12,8 @@ mod source;
 #[allow(clippy::absurd_extreme_comparisons)]
 mod spa;
 
+mod dll;
+
 mod keys;
 mod sound;
 mod utils;
