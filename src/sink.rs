@@ -26,7 +26,7 @@ struct State {
   following:     bool,
   cur_timestamp: u64,  // method invocation timestamp for `process`
   old_timestamp: u64,
-  oss_delay:     usize // additional delay in 1/8ths of period
+  oss_delay:     u32 // additional delay in 1/8ths of period
 }
 
 impl State {
@@ -67,10 +67,6 @@ impl PortConfig {
   fn stride(&self) -> u32 {
     self.bytes_per_sample() * self.channels
   }
-
-  /*fn bytes_per_ms(&self) -> f32 {
-    (self.rate * self.channels * self.bytes_per_sample()) as f32 / 1000.0
-  }*/
 }
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
@@ -191,7 +187,7 @@ unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param:
                       match (&kv[0], &kv[1]) {
                         // pw-cli set-param <object-id> Props '{ "params": ["oss.delay", 8]}'
                         (Value::String(s), Value::Int(x)) if s == "oss.delay" && *x >= 0 => {
-                          state.oss_delay = *x as usize;
+                          state.oss_delay = *x as u32;
                         },
                         _ => ()
                       }
@@ -618,7 +614,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     assert_eq!(data_0.type_, SPA_DATA_MemPtr);
 
     let offset = (*data_0.chunk).offset % data_0.maxsize; //TODO: should this be `(*data_0.chunk).offset.min(data_0.maxsize)` instead?
-    let size   = (*data_0.chunk).size.min(data_0.maxsize - offset) as libc::size_t;
+    let size   = (*data_0.chunk).size.min(data_0.maxsize - offset);
 
     debug_assert_eq!((*data_0.chunk).stride, port_config.stride() as i32);
 
@@ -630,25 +626,26 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     #[cfg(debug_assertions)]
     if state.log.log_level() >= SPA_LOG_LEVEL_TRACE {
       crate::trace!(state.log, "offset: {}, chunk size: {}", offset, size);
-      spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size));
+      spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size) as usize);
     }
 
     let driver_clock    = (*state.position).clock;
-    let period_in_bytes = (driver_clock.target_duration as u32 * port_config.stride()) as usize;
+    let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
 
     if !port.dsp.is_running() {
 
       let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
 
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MAX /* ? */, driver_clock.target_duration as u32, driver_clock.target_rate.denom);
+      port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN /* ? */, period_in_bytes as u32, driver_clock.target_rate.denom);
+
+      port.dsp.set_buffer_size(period_in_bytes * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
 
       #[cfg(debug_assertions)]
       crate::warn!(state.log, "{}: writing initial {} zeroes", port.dsp.path, target_delay_in_bytes);
 
       // there might be a slight delay on playback start,
       // making the overall buffer delay a bit higher than expected
-      port.dsp.set_buffer_size(period_in_bytes * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
       port.dsp.write_zeroes(target_delay_in_bytes);
     } else {
       let underrun_count = port.dsp.underruns();
@@ -658,19 +655,6 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         if port.xrun_timestamp == 0 {
           port.xrun_timestamp = state.cur_timestamp;
         }
-      } else if !state.rate_match.is_null() {
-
-        assert_eq!(MAX_PORTS, 1); // I don't think this would work with multiple ports
-
-        let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
-        let odelay = port.dsp.odelay() as usize;
-
-        let err  = (odelay as isize - target_delay_in_bytes as isize) as f64 / port_config.stride() as f64;
-        let corr = port.dll.update(err.clamp(-128.0, 128.0));
-
-        eprintln!("corr: {}, err: {} ({} - {})", corr, err, odelay, target_delay_in_bytes);
-
-        (*state.rate_match).rate = corr.clamp(0.98, 1.02);
       }
     }
 
@@ -693,6 +677,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
         let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
 
+        port.dll.init();
+        port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN /* ? */, period_in_bytes, driver_clock.target_rate.denom);
+
         #[cfg(debug_assertions)]
         crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, target_delay_in_bytes);
 
@@ -705,11 +692,24 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         size as isize
       }
     } else {
+      if !state.rate_match.is_null() {
+        let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+        let odelay = port.dsp.odelay();
+
+        let err  = (odelay as isize - target_delay_in_bytes as isize) as f64;
+        //let corr = port.dll.update(err.clamp(-128.0, 128.0));
+        let corr = port.dll.update(err.clamp(-(period_in_bytes as f64), period_in_bytes as f64));
+
+        eprintln!("{}: corr = {}, err = {} ({} - {})", port.dsp.path, corr, err, odelay, target_delay_in_bytes);
+
+        (*state.rate_match).rate = corr.clamp(0.99, 1.01);
+      }
+
       port.dsp.write(data_0.data.offset(offset as isize), size)
     };
 
     if nbytes < size as isize {
-      crate::warn!(state.log, "{}: dropped {} bytes", port.dsp.path, if nbytes > 0 { size - nbytes as usize } else { size });
+      crate::warn!(state.log, "{}: dropped {} bytes", port.dsp.path, if nbytes > 0 { size - nbytes as u32 } else { size });
     }
 
     (*port.io).status = SPA_STATUS_NEED_DATA as i32;
@@ -757,6 +757,7 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
     SPA_IO_RateMatch => {
       let rate_match = data as *mut spa_io_rate_match;
       if !rate_match.is_null() {
+        assert_eq!(MAX_PORTS, 1); // I don't think this would work with multiple ports
         (*rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
       }
       state.rate_match = rate_match;
