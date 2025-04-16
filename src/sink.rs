@@ -629,15 +629,15 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size) as usize);
     }
 
-    let driver_clock    = (*state.position).clock;
-    let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
+    let driver_clock = (*state.position).clock;
 
     if !port.dsp.is_running() {
 
+      let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
       let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
 
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN /* ? */, period_in_bytes as u32, driver_clock.target_rate.denom);
+      port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes as u32, driver_clock.target_rate.denom * port_config.stride());
 
       port.dsp.set_buffer_size(period_in_bytes * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
 
@@ -660,8 +660,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     let nbytes = if port.xrun_timestamp != 0 {
 
-      let clock  = (*state.position).clock;
-      let period = clock.target_duration * SPA_NSEC_PER_SEC as u64 / clock.target_rate.denom as u64;
+      let period = driver_clock.target_duration * SPA_NSEC_PER_SEC as u64 / driver_clock.target_rate.denom as u64;
       let diff   = state.cur_timestamp - state.old_timestamp;
 
       // not sure if that does anything of value
@@ -670,15 +669,16 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }*/
 
       // we are going to wait for the appropriate conditions to continue normal playback
-      if clock.nsec > port.xrun_timestamp && clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
+      if driver_clock.nsec > port.xrun_timestamp && driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
         diff >= period && diff < period + 1_000_000 /* ? */
       {
         port.xrun_timestamp = 0;
 
+        let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
         let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
 
         port.dll.init();
-        port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN /* ? */, period_in_bytes, driver_clock.target_rate.denom);
+        port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
 
         #[cfg(debug_assertions)]
         crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, target_delay_in_bytes);
@@ -687,22 +687,26 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         port.dsp.write(data_0.data.offset(offset as isize), period_in_bytes)
       } else {
         #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, clock.nsec);
+        crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, driver_clock.nsec);
 
         size as isize
       }
     } else {
+      // PipeWire's ALSA DLL usage is quite a bit more elaborate than this. Should we do something about it?
       if !state.rate_match.is_null() {
+
+        let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
         let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
-        let odelay = port.dsp.odelay();
 
-        let err  = (odelay as isize - target_delay_in_bytes as isize) as f64;
-        //let corr = port.dll.update(err.clamp(-128.0, 128.0));
-        let corr = port.dll.update(err.clamp(-(period_in_bytes as f64), period_in_bytes as f64));
+        let err  = (port.dsp.odelay() as isize - target_delay_in_bytes as isize) as f64;
+        let corr = port.dll.update(err /*.clamp(-((period_in_bytes / 8) as f64), (period_in_bytes / 8) as f64)*/);
 
-        eprintln!("{}: corr = {}, err = {} ({} - {})", port.dsp.path, corr, err, odelay, target_delay_in_bytes);
+        #[cfg(debug_assertions)]
+        eprintln!("{}: corr = {}, err = {}", port.dsp.path, corr, err);
 
         (*state.rate_match).rate = corr.clamp(0.99, 1.01);
+
+        //TODO: assign state.clock.delay and state.clock.rate_diff?
       }
 
       port.dsp.write(data_0.data.offset(offset as isize), size)
