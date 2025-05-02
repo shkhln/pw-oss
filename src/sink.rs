@@ -633,6 +633,40 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     if !port.dsp.is_running() {
 
+      #[cfg(debug_assertions)]
+      {
+        fn prio_type(type_: libc::c_ushort) -> &'static str {
+          match type_ {
+            libc::RTP_PRIO_REALTIME => "realtime",
+            libc::RTP_PRIO_NORMAL   => "normal",
+            libc::RTP_PRIO_IDLE     => "idle",
+            _ => "?"
+          }
+        }
+
+        fn gettid() -> i32 {
+          let mut tid = 0;
+          if unsafe { libc::thr_self(&mut tid) } != -1 {
+            assert!(tid <= i32::MAX as i64);
+            tid as i32
+          } else {
+            0
+          }
+        }
+
+        let mut rtp = libc::rtprio { type_: 0, prio:  0 };
+
+        let pid = libc::getpid();
+        if libc::rtprio(libc::RTP_LOOKUP, pid, &mut rtp) != -1 {
+          crate::warn!(state.log, "process priority ({:5}): type = {}, prio = {}", pid, prio_type(rtp.type_), rtp.prio);
+        }
+
+        let tid = gettid();
+        if libc::rtprio_thread(libc::RTP_LOOKUP, tid as i32, &mut rtp) != -1 {
+          crate::warn!(state.log, "thread priority ({:6}): type = {}, prio = {}", tid, prio_type(rtp.type_), rtp.prio);
+        }
+      }
+
       let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
       let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
 
