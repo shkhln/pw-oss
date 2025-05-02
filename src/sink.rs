@@ -640,7 +640,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
             libc::RTP_PRIO_REALTIME => "realtime",
             libc::RTP_PRIO_NORMAL   => "normal",
             libc::RTP_PRIO_IDLE     => "idle",
-            _ => "?"
+            _ => unreachable!()
           }
         }
 
@@ -662,7 +662,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         }
 
         let tid = gettid();
-        if libc::rtprio_thread(libc::RTP_LOOKUP, tid as i32, &mut rtp) != -1 {
+        if libc::rtprio_thread(libc::RTP_LOOKUP, tid, &mut rtp) != -1 {
           crate::warn!(state.log, "thread priority ({:6}): type = {}, prio = {}", tid, prio_type(rtp.type_), rtp.prio);
         }
       }
@@ -671,7 +671,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
 
       port.dll.init();
-      port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes as u32, driver_clock.target_rate.denom * port_config.stride());
+      port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
 
       port.dsp.set_buffer_size(period_in_bytes * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
 
@@ -685,7 +685,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       let underrun_count = port.dsp.underruns();
       if underrun_count > 0 {
         //TODO: spa_node_call_xrun?
-        crate::warn!(state.log, "{}: OSS reported {} underruns @ {}", port.dsp.path, underrun_count, state.cur_timestamp);
+        crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {}", port.dsp.path, underrun_count, state.cur_timestamp);
         if port.xrun_timestamp == 0 {
           port.xrun_timestamp = state.cur_timestamp;
         }
