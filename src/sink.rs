@@ -489,7 +489,7 @@ unsafe extern "C" fn port_enum_params(
     match (id, index) {
       (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, false).unwrap(),
       (SPA_PARAM_EnumFormat, _) => return 0,
-      (SPA_PARAM_Buffers, _)    => return 0,
+      (SPA_PARAM_Buffers, _)    => return -libc::ENOENT,
       _ => return -libc::EINVAL
     };
 
