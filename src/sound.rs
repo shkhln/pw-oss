@@ -236,6 +236,7 @@ impl DspWriter {
   }
 
   pub fn open(&mut self) -> Result<(), Errno> {
+    assert_eq!(self.state, DspState::Closed);
     let path = CString::new(self.path.clone()).unwrap();
     let fd   = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
     if fd == -1 {
