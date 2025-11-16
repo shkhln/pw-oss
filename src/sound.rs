@@ -132,6 +132,8 @@ impl Dsp {
   }
 
   pub fn open(&mut self) -> Result<(), Errno> {
+    assert_eq!(self.state, DspState::Closed);
+
     let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDWR) };
     if fd == -1 {
       return Err(Errno::last());

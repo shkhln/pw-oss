@@ -40,6 +40,7 @@ struct Port {
   dsp:     crate::sound::Dsp
 }
 
+#[derive(Debug)]
 pub struct PortConfig {
   pub format:    libspa::param::audio::AudioFormat,
   pub rate:      u32,
@@ -299,35 +300,24 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
   assert!(!command.is_null());
   let body = (*command).body.body;
 
+  crate::debug!(state.log, "received command: {}", crate::utils::spa_command_to_str(&body));
+
   #[allow(non_upper_case_globals)]
   match (body.type_, body.id) {
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => {
-      for port in &mut state.ports {
-        if let Some(config) = &port.config {
-
-          port.dsp.open().unwrap();
-
-          let format = match config.format {
-            libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
-            libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
-            libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
-            libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
-            _ => unreachable!()
-          };
-
-          port.dsp.set_format(format);
-          port.dsp.set_channels(config.channels);
-          port.dsp.set_rate(config.rate);
-        }
-      }
-
       state.started   = true;
       state.following = state.node_is_follower();
       let user_data = state as *mut _ as *mut c_void;
       let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
       0
     },
-    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend | SPA_NODE_COMMAND_Pause) => {
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Pause) => {
+      state.started = false;
+      let user_data = state as *mut _ as *mut c_void;
+      let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
+      0
+    },
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend) => {
       for port in &mut state.ports {
         if !port.dsp.is_closed() {
           port.dsp.close();
@@ -489,9 +479,6 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
             let format    = libspa::param::audio::AudioFormat(raw.format);
             let positions = raw.position.iter().take(raw.channels as usize).copied().collect::<Vec<_>>();
 
-            crate::info!(state.log, "requested format: {:?} (planar = {}), flags = {}, rate = {}, channels = {}, position = {:?}",
-              format, format.is_planar(), raw.flags, raw.rate, raw.channels, positions);
-
             let config = PortConfig {
               format,
               rate:     raw.rate,
@@ -506,7 +493,29 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
               }
             };
 
-            state.ports[port_id as usize].config = Some(config);
+            crate::debug!(state.log, "reconfiguring with {:?}", config);
+
+            let mut port = &mut state.ports[port_id as usize];
+
+            if !port.dsp.is_closed() {
+              port.dsp.close();
+            }
+
+            port.dsp.open().unwrap();
+
+            let format = match config.format {
+              libspa::param::audio::AudioFormat::S32LE => crate::sound::AFMT_S32_LE,
+              libspa::param::audio::AudioFormat::S32BE => crate::sound::AFMT_S32_BE,
+              libspa::param::audio::AudioFormat::S16LE => crate::sound::AFMT_S16_LE,
+              libspa::param::audio::AudioFormat::S16BE => crate::sound::AFMT_S16_BE,
+              _ => unreachable!()
+            };
+
+            port.dsp.set_format(format);
+            port.dsp.set_channels(config.channels);
+            port.dsp.set_rate(config.rate);
+
+            port.config = Some(config);
             state.active_buffers = 0;
           },
           Ok((t, st)) => {

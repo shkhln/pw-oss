@@ -347,19 +347,7 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
   assert!(!command.is_null());
   let body = (*command).body.body;
 
-  crate::debug!(state.log, "received command: {}, {}",
-    match body.type_ {
-      SPA_TYPE_COMMAND_Node       => "SPA_TYPE_COMMAND_Node",
-      _ => "???"
-    },
-    match body.id {
-      SPA_NODE_COMMAND_Start      => "SPA_NODE_COMMAND_Start",
-      SPA_NODE_COMMAND_Suspend    => "SPA_NODE_COMMAND_Suspend",
-      SPA_NODE_COMMAND_Pause      => "SPA_NODE_COMMAND_Pause",
-      SPA_NODE_COMMAND_ParamBegin => "SPA_NODE_COMMAND_ParamBegin",
-      SPA_NODE_COMMAND_ParamEnd   => "SPA_NODE_COMMAND_ParamEnd",
-      _ => "???"
-    });
+  crate::debug!(state.log, "received command: {}", crate::utils::spa_command_to_str(&body));
 
   #[allow(non_upper_case_globals)]
   match (body.type_, body.id) {

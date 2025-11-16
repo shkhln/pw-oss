@@ -159,3 +159,17 @@ pub fn now_ns_libc() -> u64 {
   assert!(err != -1);
   (now.tv_sec * libspa::sys::SPA_NSEC_PER_SEC as i64 + now.tv_nsec) as u64
 }
+
+pub fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'static str {
+  use libspa::sys::*;
+  #[allow(non_upper_case_globals)]
+  match (body.type_, body.id) {
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start)      => "SPA_NODE_COMMAND_Start",
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Suspend)    => "SPA_NODE_COMMAND_Suspend",
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Pause)      => "SPA_NODE_COMMAND_Pause",
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamBegin) => "SPA_NODE_COMMAND_ParamBegin",
+    (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_ParamEnd)   => "SPA_NODE_COMMAND_ParamEnd",
+    (SPA_TYPE_COMMAND_Node, _)                           => "SPA_NODE_COMMAND_???",
+    _ => "???"
+  }
+}
