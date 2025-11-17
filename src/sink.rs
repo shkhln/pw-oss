@@ -544,7 +544,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
 
             crate::debug!(state.log, "reconfiguring with {:?}", config);
 
-            let mut port = &mut state.ports[port_id as usize];
+            let port = &mut state.ports[port_id as usize];
 
             if !port.dsp.is_closed() {
               port.dsp.close();
