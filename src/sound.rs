@@ -359,7 +359,7 @@ pub fn read_sndstat() -> Result<Vec<u32>, Errno> {
         }
       },
     Err(err) => {
-      return Err(Errno::from_i32(err.raw_os_error().unwrap_or(libc::EINVAL)));
+      return Err(Errno::from_raw(err.raw_os_error().unwrap_or(libc::EINVAL)));
     }
   }
   Ok(result)
