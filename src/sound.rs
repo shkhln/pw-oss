@@ -88,8 +88,8 @@ fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
   let mut s = ((n_frags as u32) << 16) | frag_size_selector as u32;
   let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &mut s) };
   assert_ne!(err, -1);
-  let out_len = ((s & 0xFFFF0000) >> 16) * (2u32 << (s & 0x0000FFFF));
-  assert!(out_len >= n_frags as u32 * (2u32 << frag_size_selector));
+  // FreeBSD writes the granted maxfrags/fragln back into `s`, possibly smaller than
+  // requested; don't assert it matches -- the caller reads the real size via GETOSPACE
 }
 
 /*fn set_trigger(fd: c_int, mask: c_int) {
@@ -271,10 +271,15 @@ impl DspWriter {
     set_rate(self.fd, rate);
   }
 
-  pub fn set_buffer_size(&mut self, len: u32) {
+  /// Request a `len`-byte output buffer and return the size the device granted.
+  /// FreeBSD clamps the fragment count, so the grant can be much smaller than
+  /// requested; size the target delay to the return value, not `len`.
+  pub fn set_buffer_size(&mut self, len: u32) -> u32 {
     assert_eq!(self.state, DspState::Setup);
-    assert!(len <= ZEROES.len() as u32);
     set_fragment(self.fd, len.div_ceil(1024) as u16, 10);
+    // nothing's written yet, so GETOSPACE reports the granted buffer size
+    let granted = ospace_in_bytes(self.fd);
+    if granted > 0 { granted as u32 } else { len }
   }
 
   pub unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
@@ -303,10 +308,25 @@ impl DspWriter {
     nbytes
   }
 
-  pub fn write_zeroes(&mut self, count: u32) {
-    assert!(count <= ZEROES.len() as u32);
-    let nbytes = unsafe { self.write(ZEROES.as_ptr().cast(), count) };
-    assert_eq!(nbytes, count as isize);
+  pub fn write_zeroes(&mut self, mut count: u32) {
+    // chunk from ZEROES (`count` can exceed its len). The fd is O_NONBLOCK, so a
+    // short write or EAGAIN is normal; prime best-effort rather than asserting and
+    // panicking out of the `extern "C"` callback (which aborts the process).
+    while count > 0 {
+      let chunk  = count.min(ZEROES.len() as u32);
+      let nbytes = unsafe { self.write(ZEROES.as_ptr().cast(), chunk) };
+      if nbytes < 0 {
+        let errno = Errno::last();
+        if errno != Errno::EAGAIN { // EAGAIN is just a full buffer; surface anything else
+          eprintln!("{}: write_zeroes: {}", self.path, errno);
+        }
+        break;
+      }
+      if nbytes == 0 {
+        break;
+      }
+      count -= nbytes as u32;
+    }
   }
 
   pub fn odelay(&self) -> u32 {

@@ -42,7 +42,8 @@ struct Port {
   io:             *mut spa_io_buffers,
   dsp:            crate::sound::DspWriter,
   xrun_timestamp: u64, // the moment we noticed an underrun (which is a bit later than the start of it)
-  dll:            crate::dll::SpaDLL
+  dll:            crate::dll::SpaDLL,
+  target_delay:   u32  // OSS buffer fill target in bytes, clamped to the granted buffer
 }
 
 #[derive(Debug)]
@@ -643,6 +644,10 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     let driver_clock = (*state.position).clock;
 
+    // we size target_delay assuming the chunk written each cycle is at most one quantum
+    debug_assert!(size <= driver_clock.target_duration as u32 * port_config.stride(),
+      "chunk size {} exceeds one quantum {}", size, driver_clock.target_duration as u32 * port_config.stride());
+
     if !port.dsp.is_running() {
 
       #[cfg(debug_assertions)]
@@ -679,20 +684,32 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         }
       }
 
-      let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
-      let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+      let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
+      let desired_delay   = period_in_bytes / 8 * state.oss_delay;
+
+      // FreeBSD often grants a smaller buffer than requested, so size the target
+      // against what we actually got. We write one quantum/cycle on top of what's
+      // queued, so target_delay + period <= granted avoids short-writes and one
+      // quantum queued avoids underrun; both need granted >= 2 * period.
+      let granted = port.dsp.set_buffer_size(period_in_bytes * 2 + desired_delay);
+      port.target_delay = if granted >= 2 * period_in_bytes {
+        desired_delay.clamp(period_in_bytes, granted - period_in_bytes)
+      } else {
+        granted / 2 // buffer too small for two quanta; best-effort, will drop (warned below)
+      };
 
       port.dll.init();
       port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
 
-      port.dsp.set_buffer_size(period_in_bytes * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
+      crate::warn!(state.log, "{}: buffer requested {}, granted {}, period {}, target delay {}",
+        port.dsp.path, period_in_bytes * 2 + desired_delay, granted, period_in_bytes, port.target_delay);
+      if granted < 2 * period_in_bytes {
+        crate::warn!(state.log, "{}: granted OSS buffer ({}) is smaller than two quanta ({}); \
+          audio will glitch \u{2014} lower the PipeWire quantum or raise hw.snd.latency",
+          port.dsp.path, granted, period_in_bytes * 2);
+      }
 
-      #[cfg(debug_assertions)]
-      crate::warn!(state.log, "{}: writing initial {} zeroes", port.dsp.path, target_delay_in_bytes);
-
-      // there might be a slight delay on playback start,
-      // making the overall buffer delay a bit higher than expected
-      port.dsp.write_zeroes(target_delay_in_bytes);
+      port.dsp.write_zeroes(port.target_delay);
     } else {
       let underrun_count = port.dsp.underruns();
       if underrun_count > 0 {
@@ -720,17 +737,22 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       {
         port.xrun_timestamp = 0;
 
-        let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
-        let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+        let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
 
         port.dll.init();
         port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
 
-        #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, target_delay_in_bytes);
+        // buffer's already sized; re-prime only up to target, accounting for what's
+        // still queued (a full target_delay would push odelay past the buffer)
+        let odelay = port.dsp.odelay();
+        let refill = port.target_delay.saturating_sub(odelay);
 
-        port.dsp.write_zeroes(target_delay_in_bytes);
-        port.dsp.write(data_0.data.offset(offset as isize), period_in_bytes)
+        #[cfg(debug_assertions)]
+        crate::warn!(state.log, "{}: re-priming with {} zeroes (odelay {})", port.dsp.path, refill, odelay);
+
+        port.dsp.write_zeroes(refill);
+        // write `size`, not `period_in_bytes`: only `size` bytes at `offset` are owned
+        port.dsp.write(data_0.data.offset(offset as isize), size)
       } else {
         #[cfg(debug_assertions)]
         crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, driver_clock.nsec);
@@ -741,10 +763,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       // PipeWire's ALSA DLL usage is quite a bit more elaborate than this. Should we do something about it?
       if !state.rate_match.is_null() {
 
-        let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
-        let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
-
-        let err  = (port.dsp.odelay() as isize - target_delay_in_bytes as isize) as f64;
+        // drive the resampler so odelay converges to target_delay (err in bytes, like set_bw)
+        let err  = (port.dsp.odelay() as isize - port.target_delay as isize) as f64;
         let corr = port.dll.update(err /*.clamp(-((period_in_bytes / 8) as f64), (period_in_bytes / 8) as f64)*/);
 
         #[cfg(debug_assertions)]
@@ -968,7 +988,8 @@ unsafe extern "C" fn init(
         io:             std::ptr::null_mut(),
         dsp:            crate::sound::DspWriter::new(&dsp_path),
         xrun_timestamp: 0,
-        dll:            std::default::Default::default()
+        dll:            std::default::Default::default(),
+        target_delay:   0
       };
       MAX_PORTS
     ],
