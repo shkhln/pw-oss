@@ -271,10 +271,19 @@ impl DspWriter {
     set_rate(self.fd, rate);
   }
 
-  pub fn set_buffer_size(&mut self, len: u32) {
+  /// Request an output buffer of `len` bytes and return the size the device
+  /// actually granted. FreeBSD's pcm layer clamps the fragment count, so the
+  /// granted buffer can be much smaller than requested; callers must size their
+  /// target delay to the returned value rather than assuming `len` was honored.
+  pub fn set_buffer_size(&mut self, len: u32) -> u32 {
     assert_eq!(self.state, DspState::Setup);
     assert!(len <= ZEROES.len() as u32);
     set_fragment(self.fd, len.div_ceil(1024) as u16, 10);
+    // Before any data is written the whole output buffer is free, so GETOSPACE
+    // reports the actual granted buffer size. Fall back to the request if the
+    // device doesn't report it yet.
+    let granted = ospace_in_bytes(self.fd);
+    if granted > 0 { granted as u32 } else { len }
   }
 
   pub unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
@@ -305,8 +314,20 @@ impl DspWriter {
 
   pub fn write_zeroes(&mut self, count: u32) {
     assert!(count <= ZEROES.len() as u32);
-    let nbytes = unsafe { self.write(ZEROES.as_ptr().cast(), count) };
-    assert_eq!(nbytes, count as isize);
+    // The OSS device is opened O_NONBLOCK, so write(2) may accept fewer bytes
+    // than requested (a short write) or fail with EAGAIN when the playback
+    // buffer is full. Priming with silence is best-effort: write what fits and
+    // stop, rather than asserting and panicking out of an `extern "C"` callback
+    // (which would abort the whole process).
+    let mut off: usize = 0;
+    while off < count as usize {
+      let nbytes = unsafe { self.write(ZEROES.as_ptr().add(off).cast(), count - off as u32) };
+      if nbytes <= 0 {
+        // -1 (EAGAIN/error) or 0: device can't take more right now; give up.
+        break;
+      }
+      off += nbytes as usize;
+    }
   }
 
   pub fn odelay(&self) -> u32 {
