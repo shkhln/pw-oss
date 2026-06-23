@@ -88,8 +88,8 @@ fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
   let mut s = ((n_frags as u32) << 16) | frag_size_selector as u32;
   let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &mut s) };
   assert_ne!(err, -1);
-  let out_len = ((s & 0xFFFF0000) >> 16) * (2u32 << (s & 0x0000FFFF));
-  assert!(out_len >= n_frags as u32 * (2u32 << frag_size_selector));
+  let out_len = ((s & 0xFFFF0000) >> 16) * (1u32 << (s & 0x0000FFFF));
+  assert!(out_len >= n_frags as u32 * (1u32 << frag_size_selector));
 }
 
 /*fn set_trigger(fd: c_int, mask: c_int) {
