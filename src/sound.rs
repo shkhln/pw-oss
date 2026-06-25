@@ -24,6 +24,9 @@ const SNDCTL_DSP_GETERROR:    c_ulong = nix::request_code_read!     (b'P', 25, s
 const PCM_ENABLE_INPUT:  c_int = 0x00000001;
 const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
 
+// sys/dev/sound/pcm/channel.h
+const CHN_2NDBUFMAXSIZE: usize = 131072;
+
 #[repr(C)]
 struct audio_buf_info {
   fragments:  c_int,
@@ -215,7 +218,7 @@ pub struct DspWriter {
   prev_ns: u64
 }
 
-const ZEROES: [u8; 131072] = [0u8; 131072];
+const ZEROES: [u8; CHN_2NDBUFMAXSIZE] = [0u8; CHN_2NDBUFMAXSIZE];
 
 impl DspWriter {
 
@@ -273,7 +276,7 @@ impl DspWriter {
 
   pub fn set_buffer_size(&mut self, len: u32) {
     assert_eq!(self.state, DspState::Setup);
-    assert!(len <= ZEROES.len() as u32);
+    assert!(len <= CHN_2NDBUFMAXSIZE as u32);
     set_fragment(self.fd, len.div_ceil(1024) as u16, 10);
   }
 
