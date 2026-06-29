@@ -5,6 +5,34 @@ use libspa::sys::*;
 
 const MAX_PORTS: usize = 1;
 
+fn oss_buffer_request(period_in_bytes: u32, oss_delay: u32, log_path: &str, log: &crate::spa::Log, last_warn: &mut Option<(u32, u32)>) -> (u32, u32) {
+  use crate::sound::CHN_2NDBUFMAXSIZE;
+  let cap   = CHN_2NDBUFMAXSIZE as u32;
+  let delay = period_in_bytes.saturating_mul(oss_delay).saturating_div(8);
+
+  let mut warn_once = |msg: String| {
+    let key = (period_in_bytes, oss_delay);
+    if last_warn.as_ref() != Some(&key) {
+      crate::warn!(log, "{}", msg);
+      *last_warn = Some(key);
+    }
+  };
+
+  let want2 = period_in_bytes.saturating_mul(2).saturating_add(delay);
+  if want2 <= cap {
+    return (want2, delay);
+  }
+
+  let want1 = period_in_bytes.saturating_add(delay);
+  if want1 <= cap {
+    warn_once(format!("{}: OSS buffer cap {} B too small for 2x period headroom (period {} B, delay {} B); using 1x", log_path, cap, period_in_bytes, delay));
+    return (want1, delay);
+  }
+
+  warn_once(format!("{}: OSS buffer cap {} B too small for one period ({} B) with delay {} B; using cap. Lower node.force-quantum to avoid underruns.", log_path, cap, period_in_bytes, delay));
+  (cap.min(period_in_bytes), 0)
+}
+
 #[repr(C)]
 struct State {
   handle:        spa_handle,
@@ -26,7 +54,8 @@ struct State {
   following:     bool,
   cur_timestamp: u64,  // method invocation timestamp for `process`
   old_timestamp: u64,
-  oss_delay:     u32 // additional delay in 1/8ths of period
+  oss_delay:     u32, // additional delay in 1/8ths of period
+  channels:      u32
 }
 
 impl State {
@@ -42,7 +71,8 @@ struct Port {
   io:             *mut spa_io_buffers,
   dsp:            crate::sound::DspWriter,
   xrun_timestamp: u64, // the moment we noticed an underrun (which is a bit later than the start of it)
-  dll:            crate::dll::SpaDLL
+  dll:            crate::dll::SpaDLL,
+  last_warn:      Option<(u32, u32)>
 }
 
 #[derive(Debug)]
@@ -480,7 +510,7 @@ unsafe extern "C" fn port_enum_params(
 
     #[allow(non_upper_case_globals)]
     match (id, index) {
-      (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, false).unwrap(),
+      (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, state.channels).unwrap(),
       (SPA_PARAM_EnumFormat, _) => return 0,
       (SPA_PARAM_Buffers, _)    => return -libc::ENOENT,
       _ => return -libc::EINVAL
@@ -576,7 +606,8 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
           }
         };
       } else {
-        state.ports[port_id as usize].config = None;
+        state.ports[port_id as usize].config    = None;
+        state.ports[port_id as usize].last_warn = None;
       }
 
       //TODO: emit port info
@@ -680,12 +711,22 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }
 
       let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
-      let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+      let (buffer_size, target_delay_in_bytes) =
+        oss_buffer_request(period_in_bytes, state.oss_delay, &port.dsp.path, &state.log, &mut port.last_warn);
 
       port.dll.init();
       port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
 
-      port.dsp.set_buffer_size(period_in_bytes * 2 /* enough space to not overrun the buffer */ + target_delay_in_bytes);
+      if let Err(granted) = port.dsp.set_buffer_size(buffer_size, period_in_bytes) {
+        crate::error!(state.log,
+          "{}: granted OSS buffer {} B too small for one period ({} B); aborting stream. Lower PipeWire quantum.",
+          port.dsp.path, granted, period_in_bytes);
+        if !port.dsp.is_closed() {
+          port.dsp.close();
+        }
+        port.config = None;
+        continue;
+      }
 
       #[cfg(debug_assertions)]
       crate::warn!(state.log, "{}: writing initial {} zeroes", port.dsp.path, target_delay_in_bytes);
@@ -721,7 +762,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         port.xrun_timestamp = 0;
 
         let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
-        let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+        let (_buffer_size, target_delay_in_bytes) =
+          oss_buffer_request(period_in_bytes, state.oss_delay, &port.dsp.path, &state.log, &mut port.last_warn);
 
         port.dll.init();
         port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
@@ -742,7 +784,8 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       if !state.rate_match.is_null() {
 
         let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
-        let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
+        let (_buffer_size, target_delay_in_bytes) =
+          oss_buffer_request(period_in_bytes, state.oss_delay, &port.dsp.path, &state.log, &mut port.last_warn);
 
         let err  = (port.dsp.odelay() as isize - target_delay_in_bytes as isize) as f64;
         let corr = port.dll.update(err /*.clamp(-((period_in_bytes / 8) as f64), (period_in_bytes / 8) as f64)*/);
@@ -889,6 +932,7 @@ unsafe extern "C" fn init(
   assert!(timer_fd >= 0);
 
   let mut dsp_path = None;
+  let mut channels = None;
 
   if let Some(info) = info.as_ref() {
     #[cfg(debug_assertions)]
@@ -898,11 +942,14 @@ unsafe extern "C" fn init(
     crate::spa::for_each_dict_item(info, |key, value| {
       if key == crate::keys::OSS_DSP_PATH {
         dsp_path = Some(value.to_string());
+      } else if key == crate::keys::OSS_CHANNELS {
+        channels = value.parse::<u32>().ok();
       }
     });
   }
 
   let dsp_path = dsp_path.unwrap();
+  let channels = channels.unwrap_or(2);
 
   let state = handle.cast::<State>().as_mut()
     .expect("handle is not supposed to be null");
@@ -968,7 +1015,8 @@ unsafe extern "C" fn init(
         io:             std::ptr::null_mut(),
         dsp:            crate::sound::DspWriter::new(&dsp_path),
         xrun_timestamp: 0,
-        dll:            std::default::Default::default()
+        dll:            std::default::Default::default(),
+        last_warn:      None
       };
       MAX_PORTS
     ],
@@ -979,7 +1027,8 @@ unsafe extern "C" fn init(
     cur_timestamp: 0,
     old_timestamp: 0,
 
-    oss_delay: 10 // eh, whatever
+    oss_delay: if channels > 2 { 16 } else { 8 },
+    channels
   });
 
   state.node_info.fix_pointers();

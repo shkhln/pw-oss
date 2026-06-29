@@ -23,7 +23,8 @@ struct State {
   ports:          [Port; MAX_PORTS],
   started:        bool,
   following:      bool,
-  active_buffers: usize
+  active_buffers: usize,
+  channels:       u32
 }
 
 impl State {
@@ -424,7 +425,7 @@ unsafe extern "C" fn port_enum_params(
 
     #[allow(non_upper_case_globals)]
     match (id, index) {
-      (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, true).unwrap(),
+      (SPA_PARAM_EnumFormat, 0) => crate::utils::build_enum_format_info(&mut builder, state.channels).unwrap(),
       (SPA_PARAM_EnumFormat, _) => return 0,
       (SPA_PARAM_Buffers, _)    => return -libc::ENOENT,
       _ => return -libc::EINVAL
@@ -733,6 +734,7 @@ unsafe extern "C" fn init(
   assert!(timer_fd >= 0);
 
   let mut dsp_path = None;
+  let mut channels  = None;
 
   if let Some(info) = info.as_ref() {
     #[cfg(debug_assertions)]
@@ -742,11 +744,14 @@ unsafe extern "C" fn init(
     crate::spa::for_each_dict_item(info, |key, value| {
       if key == crate::keys::OSS_DSP_PATH {
         dsp_path = Some(value.to_string());
+      } else if key == crate::keys::OSS_CHANNELS {
+        channels = value.parse::<u32>().ok();
       }
     });
   }
 
   let dsp_path = dsp_path.unwrap();
+  let channels = channels.unwrap_or(2);
 
   let state = handle.cast::<State>().as_mut()
     .expect("handle is not supposed to be null");
@@ -809,7 +814,8 @@ unsafe extern "C" fn init(
     started:   false,
     following: false,
 
-    active_buffers: 0
+    active_buffers: 0,
+    channels
   });
 
   state.node_info.fix_pointers();
