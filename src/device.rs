@@ -199,7 +199,9 @@ unsafe extern "C" fn init(
 ) -> c_int
 {
   let log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log.as_ptr().cast()) as *mut spa_log;
-  let log = crate::spa::Log::wrap(log);
+
+  #[allow(static_mut_refs)]
+  let log = crate::spa::Log::wrap(log, Some(&OSS_DEVICE_TOPIC));
 
   let state = handle.cast::<State>().as_mut()
     .expect("handle is not supposed to be null");
@@ -335,4 +337,11 @@ pub const OSS_DEVICE_FACTORY: spa_handle_factory = spa_handle_factory {
   get_size:            Some(get_size),
   init:                Some(init),
   enum_interface_info: Some(enum_interface_info)
+};
+
+pub static mut OSS_DEVICE_TOPIC: spa_log_topic = spa_log_topic {
+  version:          SPA_VERSION_LOG_TOPIC,
+  topic:            c"oss.device".as_ptr(),
+  level:            0,
+  has_custom_level: false
 };

@@ -414,32 +414,38 @@ impl System {
 }
 
 pub struct Log {
-  logger:  &'static spa_log,        // not really 'static, but it should outlive our plugin anyway
-  methods: &'static spa_log_methods // ditto
+  logger:  &'static spa_log,         // not really 'static, but it should outlive our plugin anyway
+  methods: &'static spa_log_methods, // ditto
+  topic:   Option<&'static spa_log_topic>
 }
 
-//TODO: spa_log_topic?
 impl Log {
 
-  pub unsafe fn wrap(log: *mut spa_log) -> Self {
+  pub unsafe fn wrap(log: *mut spa_log, topic: Option<&'static spa_log_topic>) -> Self {
     let logger  = log.cast::<spa_log>().as_ref()
       .expect("log should be initialized");
     let methods = logger.iface.cb.funcs.cast::<spa_log_methods>().as_ref()
       .expect("log methods should be initialized");
     assert!(methods.version >= SPA_VERSION_LOG_METHODS);
-    Self { logger, methods }
+    Self { logger, methods, topic }
   }
 
   pub fn log_level(&self) -> spa_log_level {
-    self.logger.level
+    if let Some(topic) = self.topic {
+      if topic.has_custom_level { topic.level } else { self.logger.level }
+    } else {
+      self.logger.level
+    }
   }
 
   pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
-    let log  = self.methods.log.expect("log should be initialized");
-    let file = CString::new(file).unwrap();
-    let func = CString::new(func).unwrap();
-    let msg  = CString::new(msg) .unwrap();
-    unsafe { log(self.logger.iface.cb.data, level, file.as_ptr(), line, func.as_ptr(), c"%s".as_ptr(), msg.as_ptr()); }
+    let logt  = self.methods.logt.expect("logt should be initialized");
+    let topic = self.topic.map(|topic| &raw const *topic).unwrap_or(std::ptr::null());
+    let file  = CString::new(file).unwrap();
+    let func  = CString::new(func).unwrap();
+    let msg   = CString::new(msg) .unwrap();
+    unsafe { logt(self.logger.iface.cb.data, level, topic,
+      file.as_ptr(), line, func.as_ptr(), c"%s".as_ptr(), msg.as_ptr()); }
   }
 }
 

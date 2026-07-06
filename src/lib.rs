@@ -36,3 +36,47 @@ pub unsafe extern "C" fn spa_handle_factory_enum(factory: *mut *const spa_handle
     _ => 0
   }
 }
+
+use libspa::sys::{spa_log_topic, spa_log_topic_enum, SPA_VERSION_LOG_TOPIC_ENUM};
+
+#[allow(dead_code)]
+#[cfg(target_pointer_width = "64")]
+#[repr(align(8))]
+struct AlignedTopicPointer(*mut spa_log_topic);
+
+#[link_section = "spa_log_topic"]
+#[no_mangle]
+#[used]
+static mut spa_log_topic_export_oss_device:  AlignedTopicPointer =
+  AlignedTopicPointer(&raw mut device::OSS_DEVICE_TOPIC);
+
+#[link_section = "spa_log_topic"]
+#[no_mangle]
+#[used]
+static mut spa_log_topic_export_oss_sink:    AlignedTopicPointer =
+  AlignedTopicPointer(&raw mut sink::OSS_SINK_TOPIC);
+
+#[link_section = "spa_log_topic"]
+#[no_mangle]
+#[used]
+static mut spa_log_topic_export_oss_source:  AlignedTopicPointer =
+  AlignedTopicPointer(&raw mut source::OSS_SOURCE_TOPIC);
+
+#[link_section = "spa_log_topic"]
+#[no_mangle]
+#[used]
+static mut spa_log_topic_export_oss_monitor: AlignedTopicPointer =
+  AlignedTopicPointer(&raw mut monitor::OSS_MONITOR_TOPIC);
+
+extern "C" {
+  static __start_spa_log_topic: *mut spa_log_topic;
+  static __stop_spa_log_topic:  *mut spa_log_topic;
+}
+
+#[no_mangle]
+#[used]
+static mut spa_log_topic_enum: spa_log_topic_enum = libspa::sys::spa_log_topic_enum {
+  version: SPA_VERSION_LOG_TOPIC_ENUM,
+  topics:     &raw const __start_spa_log_topic,
+  topics_end: &raw const __stop_spa_log_topic,
+};
