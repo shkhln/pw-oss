@@ -15,7 +15,7 @@ const SNDCTL_DSP_CHANNELS:    c_ulong = nix::request_code_readwrite!(b'P',  6, s
 const SNDCTL_DSP_SETFRAGMENT: c_ulong = nix::request_code_readwrite!(b'P', 10, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETOSPACE:   c_ulong = nix::request_code_read!     (b'P', 12, std::mem::size_of::<audio_buf_info>());
 const SNDCTL_DSP_GETISPACE:   c_ulong = nix::request_code_read!     (b'P', 13, std::mem::size_of::<audio_buf_info>());
-//const SNDCTL_DSP_SETTRIGGER:  c_ulong = nix::request_code_write!    (b'P', 16, std::mem::size_of::<c_int>());
+const SNDCTL_DSP_SETTRIGGER:  c_ulong = nix::request_code_write!    (b'P', 16, std::mem::size_of::<c_int>());
 //const SNDCTL_DSP_GETPLAYVOL:  c_ulong = nix::request_code_read!     (b'P', 24, std::mem::size_of::<c_int>());
 //const SNDCTL_DSP_SETPLAYVOL:  c_ulong = nix::request_code_readwrite!(b'P', 24, std::mem::size_of::<c_int>());
 const SNDCTL_DSP_GETODELAY:   c_ulong = nix::request_code_read!     (b'P', 23, std::mem::size_of::<c_int>());
@@ -78,6 +78,15 @@ fn set_rate(fd: c_int, rate: u32) {
   assert_eq!(n, rate as c_int);
 }
 
+fn ispace_in_bytes(fd: c_int) -> c_int {
+  let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
+  unsafe {
+    let err = libc::ioctl(fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr());
+    assert_ne!(err, -1);
+    info.assume_init().bytes
+  }
+}
+
 fn ospace_in_bytes(fd: c_int) -> c_int {
   let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
   unsafe {
@@ -95,12 +104,12 @@ fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
   assert!(out_len >= n_frags as u32 * (1u32 << frag_size_selector));
 }
 
-/*fn set_trigger(fd: c_int, mask: c_int) {
+fn set_trigger(fd: c_int, mask: c_int) {
   let mut m = mask as c_int;
   let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETTRIGGER, &mut m) };
   assert_ne!(err, -1);
   assert_eq!(m, mask as c_int);
-}*/
+}
 
 fn odelay(fd: c_int) -> c_int {
   let mut delay: c_int = -1;
@@ -118,26 +127,39 @@ fn get_error(fd: c_int) -> audio_errinfo {
   }
 }
 
-pub struct Dsp {
-  path:  CString,
+pub struct DspReader {
+  pub path:  String,
   fd:    c_int,
-  state: DspState
+  state: DspState,
+  #[cfg(debug_assertions)]
+  prev_ns: u64
 }
 
-impl Dsp {
+impl DspReader {
 
   pub fn new(path: &str) -> Self {
-    Self { path: CString::new(path).unwrap(), fd: -1, state: DspState::Closed }
+    Self {
+      path:    path.to_string(),
+      fd:      -1,
+      state:   DspState::Closed,
+      #[cfg(debug_assertions)]
+      prev_ns: 0
+    }
   }
 
   pub fn is_closed(&self) -> bool {
     self.state == DspState::Closed
   }
 
+  pub fn is_running(&self) -> bool {
+    self.state == DspState::Running
+  }
+
   pub fn open(&mut self) -> Result<(), Errno> {
     assert_eq!(self.state, DspState::Closed);
 
-    let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDWR) };
+    let path = CString::new(self.path.clone()).unwrap();
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
     if fd == -1 {
       return Err(Errno::last());
     }
@@ -170,43 +192,53 @@ impl Dsp {
     set_rate(self.fd, rate);
   }
 
-  pub unsafe fn read(&mut self, buf: *mut c_void, count: size_t) -> ssize_t {
+  pub fn set_buffer_size(&mut self, len: u32) {
+    assert_eq!(self.state, DspState::Setup);
+    assert!(len <= CHN_2NDBUFMAXSIZE as u32);
+    set_fragment(self.fd, len.div_ceil(1024) as u16, 10);
+  }
+
+  pub unsafe fn read(&mut self, buf: *mut c_void, count: u32) -> ssize_t {
     if self.state == DspState::Setup {
       self.state = DspState::Running;
     }
     assert_eq!(self.state, DspState::Running);
-    libc::read(self.fd, buf, count)
+
+    #[cfg(debug_assertions)]
+    let space = ispace_in_bytes(self.fd) as usize;
+
+    let nbytes = libc::read(self.fd, buf, count as size_t);
+
+    #[cfg(debug_assertions)]
+    {
+      let now         = crate::utils::now_ns_libc();
+      let space_after = ispace_in_bytes(self.fd) as usize;
+      eprintln!("r {}: {:9} @ {}, count = {:5}, ispace = {:5} -> {:5}",
+        self.path, now - self.prev_ns, now, count, space, space_after);
+      self.prev_ns = now;
+    }
+
+    nbytes
   }
 
-  pub fn ready_for_reading(&mut self, timeout_ms: usize) -> bool {
-
-    if self.state == DspState::Setup {
-      self.state = DspState::Running;
-    }
-
+  pub fn ispace_in_bytes(&mut self) -> u32 {
     assert_eq!(self.state, DspState::Running);
-
-    let mut read_fds = std::mem::MaybeUninit::<libc::fd_set>::uninit();
-    unsafe {
-      libc::FD_ZERO(read_fds.as_mut_ptr());
-      libc::FD_SET(self.fd, read_fds.as_mut_ptr());
-    }
-
-    let mut timeout = libc::timeval { tv_sec: 0, tv_usec: timeout_ms as i64 * 1000 };
-
-    let ndesc = unsafe { libc::select(self.fd + 1, read_fds.assume_init_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut timeout) };
-    ndesc != -1 && ndesc > 0
+    let ispace = ispace_in_bytes(self.fd);
+    assert!(ispace >= 0);
+    ispace as u32
   }
 
-  pub fn ispace_in_bytes(&mut self) -> c_int {
+  pub fn overruns(&self) -> u32 {
     assert_eq!(self.state, DspState::Running);
-    let mut info = std::mem::MaybeUninit::<audio_buf_info>::uninit();
-    let err = unsafe { libc::ioctl(self.fd, SNDCTL_DSP_GETISPACE, info.as_mut_ptr()) };
-    if err != -1 {
-      unsafe { info.assume_init().bytes }
-    } else {
-      0
-    }
+    let oruns = get_error(self.fd).rec_overruns;
+    assert!(oruns >= 0);
+    oruns as u32
+  }
+
+  pub fn start(&mut self) {
+    assert_eq!(self.state, DspState::Setup);
+    set_trigger(self.fd, PCM_ENABLE_INPUT);
+    self.state = DspState::Running;
   }
 }
 
@@ -298,7 +330,7 @@ impl DspWriter {
       let now         = crate::utils::now_ns_libc();
       let space_after = ospace_in_bytes(self.fd) as usize;
       let delay_after = odelay(self.fd);
-      eprintln!("{}: {:9} @ {}, count = {:5}, ospace = {:5} -> {:5}, odelay = {:5} -> {:5}",
+      eprintln!("w {}: {:9} @ {}, count = {:5}, ospace = {:5} -> {:5}, odelay = {:5} -> {:5}",
         self.path, now - self.prev_ns, now, count, space, space_after, delay, delay_after);
       self.prev_ns = now;
     }

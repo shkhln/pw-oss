@@ -33,20 +33,15 @@ impl State {
   }
 }
 
-struct Port {
-  config:  Option<PortConfig>,
-  buffers: Vec<*mut spa_buffer>,
-  io:      *mut spa_io_buffers,
-  dsp:     crate::sound::Dsp
-}
+use crate::sink::PortConfig;
 
-#[derive(Debug)]
-pub struct PortConfig {
-  pub format:    libspa::param::audio::AudioFormat,
-  pub rate:      u32,
-  pub channels:  u32,
-  pub positions: Vec<u32>,
-  pub stride:    u32
+struct Port {
+  config:     Option<PortConfig>,
+  buffers:    Vec<*mut spa_buffer>,
+  io:         *mut spa_io_buffers,
+  dsp:        crate::sound::DspReader,
+  xrun_count: u32,
+  starting:   bool
 }
 
 unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, events: *const spa_node_events, data: *mut c_void) -> c_int {
@@ -305,8 +300,15 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
   #[allow(non_upper_case_globals)]
   match (body.type_, body.id) {
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => {
+
+      for port in &mut state.ports {
+        port.xrun_count = 0;
+        port.starting   = true;
+      }
+
       state.started   = true;
       state.following = state.node_is_follower();
+
       let user_data = state as *mut _ as *mut c_void;
       let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
       0
@@ -483,14 +485,7 @@ unsafe extern "C" fn port_set_param(object: *mut c_void, direction: spa_directio
               format,
               rate:     raw.rate,
               channels: raw.channels,
-              positions,
-              stride: match format {
-                libspa::param::audio::AudioFormat::S32LE => 4,
-                libspa::param::audio::AudioFormat::S32BE => 4,
-                libspa::param::audio::AudioFormat::S16LE => 2,
-                libspa::param::audio::AudioFormat::S16BE => 2,
-                _ => unreachable!()
-              }
+              positions
             };
 
             crate::debug!(state.log, "reconfiguring with {:?}", config);
@@ -546,9 +541,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
   let state = object.cast::<State>().as_mut()
     .expect("object is not supposed to be null");
 
-  if !state.started {
-    return SPA_STATUS_OK as i32;
-  }
+  assert!(state.started);
+
+  let now = crate::utils::now_ns(&state.data_system);
 
   let mut result = SPA_STATUS_OK as i32;
 
@@ -565,6 +560,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       continue;
     }
 
+    //TODO: active buffers?
     let buffer_id = if (*port.io).buffer_id == -1i32 as u32 {
       let idx = state.active_buffers;
       state.active_buffers += 1;
@@ -581,14 +577,53 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     let data_0 = buffer.datas.offset(0).as_ref().unwrap();
     assert_eq!(data_0.type_, SPA_DATA_MemPtr);
 
-    let nbytes = if port.dsp.ready_for_reading(1) {
-      let ispace = port.dsp.ispace_in_bytes();
-      #[cfg(debug_assertions)]
-      crate::trace!(state.log, "ispace: {}", ispace);
-      assert!(ispace as u32 <= data_0.maxsize);
-      port.dsp.read(data_0.data, ispace as usize)
+    let port_config     = port.config.as_ref().unwrap();
+    let driver_clock    = (*state.position).clock;
+    let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
+
+    let target_delay_in_bytes = period_in_bytes / 8 * 10; // ?
+
+    if !port.dsp.is_running() {
+      assert!(port.starting);
+      port.dsp.set_buffer_size(period_in_bytes * 2 + target_delay_in_bytes);
+      port.dsp.start();
     } else {
-      -1
+      port.xrun_count += port.dsp.overruns();
+    }
+
+    //crate::warn!(state.log, "{}: delay = {} ms", port.dsp.path, (now - driver_clock.nsec) as f64 / 1_000_000.0);
+
+    let nbytes = if port.starting || port.xrun_count != 0 {
+
+      if now - driver_clock.nsec < 1_000_000 /* ? */ {
+        let ispace = port.dsp.ispace_in_bytes();
+        if ispace >= period_in_bytes + target_delay_in_bytes {
+
+          // eat excess data
+          let excess = ispace - period_in_bytes - target_delay_in_bytes;
+          assert!(excess <= data_0.maxsize);
+          let _ = port.dsp.read(data_0.data, excess);
+
+          if !port.starting {
+            port.xrun_count += port.dsp.overruns();
+            crate::warn!(state.log, "{}: OSS reported {:3} overruns", port.dsp.path, port.xrun_count);
+            port.xrun_count = 0;
+          } else {
+            debug_assert_eq!(port.dsp.overruns(), 0); // ?
+            port.starting = false;
+          }
+
+          assert!(period_in_bytes <= data_0.maxsize);
+          port.dsp.read(data_0.data, period_in_bytes)
+        } else {
+          -1
+        }
+      } else {
+        -1
+      }
+    } else {
+      assert!(period_in_bytes <= data_0.maxsize);
+      port.dsp.read(data_0.data, period_in_bytes)
     };
 
     if nbytes != -1 {
@@ -598,9 +633,13 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         spa_debug_mem(0, data_0.data, 16.min(nbytes) as usize);
       }
 
+      /*if nbytes < period_in_bytes as isize {
+        crate::warn!(state.log, "read {} bytes instead of {}", nbytes, period_in_bytes);
+      }*/
+
       (*data_0.chunk).offset = 0;
       (*data_0.chunk).size   = nbytes as u32;
-      (*data_0.chunk).stride = port.config.as_ref().unwrap().stride as i32;
+      (*data_0.chunk).stride = port.config.as_ref().unwrap().stride() as i32;
       (*data_0.chunk).flags  = 0;
 
       (*port.io).buffer_id   = buffer_id;
@@ -806,7 +845,17 @@ unsafe extern "C" fn init(
       data:  std::ptr::null_mut()
     },
 
-    ports: [Port { config: None, buffers: vec![], io: std::ptr::null_mut(), dsp: crate::sound::Dsp::new(&dsp_path) }; MAX_PORTS],
+    ports: [
+      Port {
+        config:     None,
+        buffers:    vec![],
+        io:         std::ptr::null_mut(),
+        dsp:        crate::sound::DspReader::new(&dsp_path),
+        xrun_count: 0,
+        starting:   false
+      };
+      MAX_PORTS
+    ],
 
     started:   false,
     following: false,

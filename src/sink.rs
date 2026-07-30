@@ -63,7 +63,7 @@ impl PortConfig {
     }
   }
 
-  fn stride(&self) -> u32 {
+  pub fn stride(&self) -> u32 {
     self.bytes_per_sample() * self.channels
   }
 }
