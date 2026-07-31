@@ -173,3 +173,37 @@ pub fn spa_command_to_str(body: &libspa::sys::spa_pod_object_body) -> &'static s
     _ => "???"
   }
 }
+
+pub fn log_process_priority(log: &crate::spa::Log) {
+
+  fn prio_type(type_: libc::c_ushort) -> &'static str {
+    match type_ {
+      libc::RTP_PRIO_REALTIME => "realtime",
+      libc::RTP_PRIO_NORMAL   => "normal",
+      libc::RTP_PRIO_IDLE     => "idle",
+      _ => unreachable!()
+    }
+  }
+
+  fn gettid() -> i32 {
+    let mut tid = 0;
+    if unsafe { libc::thr_self(&mut tid) } != -1 {
+      assert!(tid <= i32::MAX as i64);
+      tid as i32
+    } else {
+      0
+    }
+  }
+
+  let mut rtp = libc::rtprio { type_: 0, prio:  0 };
+
+  let pid = unsafe { libc::getpid() };
+  if unsafe { libc::rtprio(libc::RTP_LOOKUP, pid, &mut rtp) != -1 } {
+    crate::debug!(log, "process priority ({:5}): type = {}, prio = {}", pid, prio_type(rtp.type_), rtp.prio);
+  }
+
+  let tid = gettid();
+  if unsafe { libc::rtprio_thread(libc::RTP_LOOKUP, tid, &mut rtp) != -1 } {
+    crate::debug!(log, "thread priority ({:6}): type = {}, prio = {}", tid, prio_type(rtp.type_), rtp.prio);
+  }
+}

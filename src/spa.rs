@@ -438,7 +438,7 @@ impl Log {
     }
   }
 
-  pub fn log(&self, level: spa_log_level, file: &str, line: c_int, func: &str, msg: &str) {
+  pub fn log(&self, level: spa_log_level, file: &str, line: std::os::raw::c_int, func: &str, msg: &str) {
     let logt  = self.methods.logt.expect("logt should be initialized");
     let topic = self.topic.map(|topic| &raw const *topic).unwrap_or(std::ptr::null());
     let file  = CString::new(file).unwrap();
@@ -456,7 +456,7 @@ macro_rules! log {
       let file = file!();
       let line = line!();
       let func = ""; //TODO: add something there?
-      $log.log($log_level, file, line as c_int, func, &format!($($arg)*));
+      $log.log($log_level, file, line as std::os::raw::c_int, func, &format!($($arg)*));
     }
   };
 }
@@ -464,34 +464,34 @@ macro_rules! log {
 #[macro_export]
 macro_rules! error {
   ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_ERROR, $($arg)*)
+    $crate::log!($log, libspa::sys::SPA_LOG_LEVEL_ERROR, $($arg)*)
   };
 }
 
 #[macro_export]
 macro_rules! warn {
   ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_WARN, $($arg)*)
+    $crate::log!($log, libspa::sys::SPA_LOG_LEVEL_WARN, $($arg)*)
   };
 }
 
 #[macro_export]
 macro_rules! info {
   ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_INFO, $($arg)*)
+    $crate::log!($log, libspa::sys::SPA_LOG_LEVEL_INFO, $($arg)*)
   };
 }
 
 #[macro_export]
 macro_rules! debug {
   ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_DEBUG, $($arg)*)
+    $crate::log!($log, libspa::sys::SPA_LOG_LEVEL_DEBUG, $($arg)*)
   };
 }
 
 #[macro_export]
 macro_rules! trace {
   ($log:expr, $($arg:tt)*) => {
-    $crate::log!($log, SPA_LOG_LEVEL_TRACE, $($arg)*)
+    $crate::log!($log, libspa::sys::SPA_LOG_LEVEL_TRACE, $($arg)*)
   };
 }
