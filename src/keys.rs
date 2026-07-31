@@ -6,3 +6,6 @@ pub const PCM_DEVICE_INDEXES: &str = "api.freebsd-oss.pcm-devices";
 
 /// Path to the dsp device file a source/sink node is supposed to open
 pub const OSS_DSP_PATH:       &str = "api.freebsd-oss.dsp-path";
+
+/// Native channel count of the underlying /dev/dspN device.
+pub const OSS_CHANNELS: &str = "api.freebsd-oss.channels";

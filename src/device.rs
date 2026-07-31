@@ -48,6 +48,9 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
         }
 
         dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
+        if let Some(ch) = device.play_channels {
+          dict.add_item(crate::keys::OSS_CHANNELS, format!("{}", ch));
+        }
 
         let obj_info = spa_device_object_info {
           version:      SPA_VERSION_DEVICE_OBJECT_INFO,
@@ -76,6 +79,9 @@ unsafe extern "C" fn add_listener(object: *mut c_void, listener: *mut spa_hook, 
         }
 
         dict.add_item(crate::keys::OSS_DSP_PATH, format!("/dev/dsp{}", device.index));
+        if let Some(ch) = device.rec_channels {
+          dict.add_item(crate::keys::OSS_CHANNELS, format!("{}", ch));
+        }
 
         let obj_info = spa_device_object_info {
           version:      SPA_VERSION_DEVICE_OBJECT_INFO,

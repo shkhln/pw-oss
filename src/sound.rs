@@ -25,7 +25,7 @@ const PCM_ENABLE_INPUT:  c_int = 0x00000001;
 const PCM_ENABLE_OUTPUT: c_int = 0x00000002;
 
 // sys/dev/sound/pcm/channel.h
-const CHN_2NDBUFMAXSIZE: usize = 131072;
+pub const CHN_2NDBUFMAXSIZE: usize = 131072;
 
 #[repr(C)]
 struct audio_buf_info {
@@ -87,12 +87,14 @@ fn ospace_in_bytes(fd: c_int) -> c_int {
   }
 }
 
-fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16) {
+fn set_fragment(fd: c_int, n_frags: u16, frag_size_selector: u16, min_usable_bytes: u32) -> Result<u32, u32> {
   let mut s = ((n_frags as u32) << 16) | frag_size_selector as u32;
   let err = unsafe { libc::ioctl(fd, SNDCTL_DSP_SETFRAGMENT, &mut s) };
   assert_ne!(err, -1);
-  let out_len = ((s & 0xFFFF0000) >> 16) * (1u32 << (s & 0x0000FFFF));
-  assert!(out_len >= n_frags as u32 * (1u32 << frag_size_selector));
+  let out_frags = ((s & 0xFFFF0000) >> 16) as u32;
+  let out_size  = 1u32 << (s & 0x0000FFFF);
+  let out_len   = out_frags.saturating_mul(out_size);
+  if out_len >= min_usable_bytes { Ok(out_len) } else { Err(out_len) }
 }
 
 /*fn set_trigger(fd: c_int, mask: c_int) {
@@ -137,7 +139,8 @@ impl Dsp {
   pub fn open(&mut self) -> Result<(), Errno> {
     assert_eq!(self.state, DspState::Closed);
 
-    let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDWR) };
+    // O_RDONLY lets OSS honour the native capture channel count.
+    let fd = unsafe { libc::open(self.path.as_ptr(), libc::O_RDONLY) };
     if fd == -1 {
       return Err(Errno::last());
     }
@@ -274,10 +277,13 @@ impl DspWriter {
     set_rate(self.fd, rate);
   }
 
-  pub fn set_buffer_size(&mut self, len: u32) {
+  pub fn set_buffer_size(&mut self, len: u32, period_bytes: u32) -> Result<(), u32> {
     assert_eq!(self.state, DspState::Setup);
     assert!(len <= CHN_2NDBUFMAXSIZE as u32);
-    set_fragment(self.fd, len.div_ceil(1024) as u16, 10);
+    match set_fragment(self.fd, len.div_ceil(1024) as u16, 10, period_bytes) {
+      Ok(_)    => Ok(()),
+      Err(got) => Err(got)
+    }
   }
 
   pub unsafe fn write(&mut self, buf: *const c_void, count: u32) -> ssize_t {
@@ -370,11 +376,17 @@ pub fn read_sndstat() -> Result<Vec<u32>, Errno> {
 
 #[derive(Debug)]
 pub struct PcmDevice {
-  pub index:    u32,
-  pub desc:     String,
-  pub location: String,
-  pub play:     bool,
-  pub rec:      bool
+  pub index:         u32,
+  pub desc:          String,
+  pub location:      String,
+  pub play:          bool,
+  pub rec:           bool,
+  pub play_channels: Option<u32>,
+  pub rec_channels:  Option<u32>
+}
+
+fn parse_channels_from_vchanformat(s: &str) -> Option<u32> {
+  s.split(':').nth(1)?.split('.').next()?.parse().ok()
 }
 
 pub fn read_pcm_device_description(sysctl: &mut crate::utils::SysctlReader, index: u32) -> Option<String> {
@@ -419,9 +431,13 @@ pub fn list_pcm_devices(indexes: &[u32]) -> Vec<PcmDevice> {
   for index in indexes {
     if let Some(desc) = read_pcm_device_description(&mut sysctl, *index) {
       if let Ok(location) = sysctl.read_string(format!("dev.pcm.{}.%location", index), 1024) {
-        let play = sysctl.read_string(format!("dev.pcm.{}.play.vchanformat", index), 1024).is_ok();
-        let rec  = sysctl.read_string(format!("dev.pcm.{}.rec.vchanformat",  index), 1024).is_ok();
-        result.push(PcmDevice { index: *index, desc, location, play, rec });
+        let play_fmt = sysctl.read_string(format!("dev.pcm.{}.play.vchanformat", index), 1024);
+        let rec_fmt  = sysctl.read_string(format!("dev.pcm.{}.rec.vchanformat",  index), 1024);
+        let play = play_fmt.is_ok();
+        let rec  = rec_fmt .is_ok();
+        let play_channels = play_fmt.as_ref().ok().and_then(|s| parse_channels_from_vchanformat(s));
+        let rec_channels  = rec_fmt .as_ref().ok().and_then(|s| parse_channels_from_vchanformat(s));
+        result.push(PcmDevice { index: *index, desc, location, play, rec, play_channels, rec_channels });
       }
     }
   }

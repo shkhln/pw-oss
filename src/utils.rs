@@ -90,7 +90,7 @@ impl DevdSocket {
   }
 }
 
-pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono: bool) -> Result<(), Errno> {
+pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, channels: u32) -> Result<(), Errno> {
 
   use libspa::sys::*;
 
@@ -124,25 +124,29 @@ pub unsafe fn build_enum_format_info(b: &mut libspa::pod::builder::Builder, mono
   b.add_int(192000)?;
   b.pop(inner.assume_init_mut());
 
-  if !mono {
-    b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
-    b.push_choice(&mut inner, SPA_CHOICE_Range, 0)?;
-    b.add_int(2)?;
-    b.add_int(1)?;
-    b.add_int(SPA_AUDIO_MAX_CHANNELS as i32)?;
-    b.pop(inner.assume_init_mut());
+  assert!(channels >= 1 && channels <= SPA_AUDIO_MAX_CHANNELS);
 
-    b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
-    b.add_array(std::mem::size_of_val(&SPA_AUDIO_CHANNEL_FL) as u32, SPA_TYPE_Id, 2,
-      [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR].as_ptr().cast())?;
-  } else {
-    b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
-    b.add_int(1)?;
-  }
+  b.add_prop(SPA_FORMAT_AUDIO_channels, 0)?;
+  b.add_int(channels as i32)?;
+
+  let positions = channel_positions(channels);
+  b.add_prop(SPA_FORMAT_AUDIO_position, 0)?;
+  b.add_array(std::mem::size_of::<u32>() as u32, SPA_TYPE_Id, channels,
+    positions.as_ptr().cast())?;
 
   b.pop(outer.assume_init_mut());
 
   Ok(())
+}
+
+fn channel_positions(channels: u32) -> Vec<u32> {
+  use libspa::sys::*;
+  match channels {
+    0 => vec![],
+    1 => vec![SPA_AUDIO_CHANNEL_MONO],
+    2 => vec![SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR],
+    n => (0..n).map(|i| SPA_AUDIO_CHANNEL_AUX0 + i).collect()
+  }
 }
 
 pub fn now_ns(system: &crate::spa::System) -> u64 {
