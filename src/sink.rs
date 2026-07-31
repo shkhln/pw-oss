@@ -24,8 +24,6 @@ struct State {
   ports:         [Port; MAX_PORTS],
   started:       bool,
   following:     bool,
-  cur_timestamp: u64,  // method invocation timestamp for `process`
-  old_timestamp: u64,
   oss_delay:     u32 // additional delay in 1/8ths of period
 }
 
@@ -37,12 +35,12 @@ impl State {
 }
 
 struct Port {
-  config:         Option<PortConfig>,
-  buffers:        Vec<*mut spa_buffer>,
-  io:             *mut spa_io_buffers,
-  dsp:            crate::sound::DspWriter,
-  xrun_timestamp: u64, // the moment we noticed an underrun (which is a bit later than the start of it)
-  dll:            crate::dll::SpaDLL
+  config:     Option<PortConfig>,
+  buffers:    Vec<*mut spa_buffer>,
+  io:         *mut spa_io_buffers,
+  dsp:        crate::sound::DspWriter,
+  dll:        crate::dll::SpaDLL,
+  xrun_count: u32
 }
 
 #[derive(Debug)]
@@ -329,9 +327,9 @@ unsafe extern "C" fn set_io(object: *mut c_void, id: u32, data: *mut c_void, siz
       // there are some weird PipeWire xruns on clock changes that are messing up our OSS buffer delay,
       // we'll just preemptively treat them as OSS underruns for now
       for port in &mut state.ports {
-        port.xrun_timestamp = crate::utils::now_ns(&state.data_system);
+        port.xrun_count += 1;
         #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: clock change @ {}", port.dsp.path, port.xrun_timestamp);
+        crate::warn!(state.log, "{}: clock change", port.dsp.path);
       }
     }
   }
@@ -354,14 +352,11 @@ unsafe extern "C" fn send_command(object: *mut c_void, command: *const spa_comma
     (SPA_TYPE_COMMAND_Node, SPA_NODE_COMMAND_Start) => {
 
       for port in &mut state.ports {
-        port.xrun_timestamp = 0;
+        port.xrun_count = 0;
       }
 
       state.started   = true;
       state.following = state.node_is_follower();
-
-      state.cur_timestamp = 0;
-      state.old_timestamp = 0;
 
       let user_data = state as *mut _ as *mut c_void;
       let _ = state.data_loop.invoke(Some(set_timers), 0, std::ptr::null(), 0, true, user_data);
@@ -596,8 +591,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
   assert!(state.started);
 
-  state.old_timestamp = state.cur_timestamp;
-  state.cur_timestamp = crate::utils::now_ns(&state.data_system);
+  let now = crate::utils::now_ns(&state.data_system);
 
   let mut result = SPA_STATUS_OK as i32;
 
@@ -630,9 +624,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
 
     debug_assert_eq!((*data_0.chunk).stride, port_config.stride() as i32);
 
+    let driver_clock = (*state.position).clock;
+
     #[cfg(debug_assertions)]
-    if (*state.position).clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0 {
-      crate::warn!(state.log, "{}: SPA_IO_CLOCK_FLAG_XRUN_RECOVER @ {}", port.dsp.path, state.cur_timestamp);
+    if driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0 {
+      crate::warn!(state.log, "{}: SPA_IO_CLOCK_FLAG_XRUN_RECOVER", port.dsp.path);
     }
 
     #[cfg(debug_assertions)]
@@ -640,8 +636,6 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       crate::trace!(state.log, "offset: {}, chunk size: {}", offset, size);
       spa_debug_mem(0, data_0.data.offset(offset as isize), 16.min(size) as usize);
     }
-
-    let driver_clock = (*state.position).clock;
 
     if !port.dsp.is_running() {
 
@@ -662,20 +656,12 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       // making the overall buffer delay a bit higher than expected
       port.dsp.write_zeroes(target_delay_in_bytes);
     } else {
-      let underrun_count = port.dsp.underruns();
-      if underrun_count > 0 {
-        //TODO: spa_node_call_xrun?
-        crate::warn!(state.log, "{}: OSS reported {:3} underruns @ {}", port.dsp.path, underrun_count, state.cur_timestamp);
-        if port.xrun_timestamp == 0 {
-          port.xrun_timestamp = state.cur_timestamp;
-        }
-      }
+      port.xrun_count += port.dsp.underruns();
     }
 
-    let nbytes = if port.xrun_timestamp != 0 {
+    let nbytes = if port.xrun_count != 0 {
 
-      let period = driver_clock.target_duration * SPA_NSEC_PER_SEC as u64 / driver_clock.target_rate.denom as u64;
-      let diff   = state.cur_timestamp - state.old_timestamp;
+      //TODO: spa_node_call_xrun?
 
       // not sure if that does anything of value
       /*if !state.clock.is_null() {
@@ -683,11 +669,11 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
       }*/
 
       // we are going to wait for the appropriate conditions to continue normal playback
-      if driver_clock.nsec > port.xrun_timestamp && driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 &&
-        diff >= period && diff < period + 1_000_000 /* ? */
+      if driver_clock.flags & SPA_IO_CLOCK_FLAG_XRUN_RECOVER == 0 && now - driver_clock.nsec < 1_000_000 /* ? */ &&
+        // sometimes (rarely) an underrun happens precisely between the last underrun check and the buffer write,
+        // which means on the next underrun check the buffer is likely not empty
+        port.dsp.odelay() == 0
       {
-        port.xrun_timestamp = 0;
-
         let period_in_bytes       = driver_clock.target_duration as u32 * port_config.stride();
         let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
 
@@ -698,10 +684,15 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         crate::warn!(state.log, "{}: writing {} zeroes", port.dsp.path, target_delay_in_bytes);
 
         port.dsp.write_zeroes(target_delay_in_bytes);
+
+        port.xrun_count += port.dsp.underruns();
+        crate::warn!(state.log, "{}: OSS reported {:3} underruns", port.dsp.path, port.xrun_count);
+        port.xrun_count = 0;
+
         port.dsp.write(data_0.data.offset(offset as isize), period_in_bytes)
       } else {
         #[cfg(debug_assertions)]
-        crate::warn!(state.log, "{}: skipping buffer @ {}", port.dsp.path, driver_clock.nsec);
+        crate::warn!(state.log, "{}: skipping buffer", port.dsp.path);
 
         size as isize
       }
@@ -933,21 +924,18 @@ unsafe extern "C" fn init(
 
     ports: [
       Port {
-        config:         None,
-        buffers:        vec![],
-        io:             std::ptr::null_mut(),
-        dsp:            crate::sound::DspWriter::new(&dsp_path),
-        xrun_timestamp: 0,
-        dll:            std::default::Default::default()
+        config:     None,
+        buffers:    vec![],
+        io:         std::ptr::null_mut(),
+        dsp:        crate::sound::DspWriter::new(&dsp_path),
+        dll:        std::default::Default::default(),
+        xrun_count: 0
       };
       MAX_PORTS
     ],
 
     started:   false,
     following: false,
-
-    cur_timestamp: 0,
-    old_timestamp: 0,
 
     oss_delay: 10 // eh, whatever
   });
