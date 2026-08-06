@@ -16,6 +16,7 @@ struct State {
   log:            crate::spa::Log,
   clock:          *mut spa_io_clock,
   position:       *mut spa_io_position,
+  rate_match:     *mut spa_io_rate_match,
   timer_source:   spa_source,
   next_time:      u64,
   hooks:          spa_hook_list,
@@ -40,6 +41,7 @@ struct Port {
   buffers:    Vec<*mut spa_buffer>,
   io:         *mut spa_io_buffers,
   dsp:        crate::sound::DspReader,
+  dll:        crate::dll::SpaDLL,
   xrun_count: u32,
   starting:   bool
 }
@@ -599,6 +601,9 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         let ispace = port.dsp.ispace_in_bytes();
         if ispace >= period_in_bytes + target_delay_in_bytes {
 
+          port.dll.init();
+          port.dll.set_bw(crate::dll::SPA_DLL_BW_MIN, period_in_bytes, driver_clock.target_rate.denom * port_config.stride());
+
           // eat excess data
           let excess = ispace - period_in_bytes - target_delay_in_bytes;
           assert!(excess <= data_0.maxsize);
@@ -622,8 +627,26 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
         -1
       }
     } else {
+
+      let bytes_to_read = if !state.rate_match.is_null() {
+
+        let nbytes = (*state.rate_match).size * port_config.stride();
+
+        let err  = (target_delay_in_bytes as isize - port.dsp.ispace_in_bytes() as isize + nbytes as isize) as f64;
+        let corr = port.dll.update(err);
+
+        #[cfg(debug_assertions)]
+        crate::warn!(state.log, "{}: corr = {:.10}, err = {:6}", port.dsp.path, corr, err);
+
+        (*state.rate_match).rate = 1.0 / corr.clamp(0.99, 1.01);
+
+        nbytes
+      } else {
+        period_in_bytes
+      };
+
       assert!(period_in_bytes <= data_0.maxsize);
-      port.dsp.read(data_0.data, period_in_bytes)
+      port.dsp.read(data_0.data, bytes_to_read)
     };
 
     if nbytes != -1 {
@@ -687,15 +710,18 @@ unsafe extern "C" fn port_set_io(object: *mut c_void, direction: spa_direction, 
   #[allow(non_upper_case_globals)]
   match id {
     SPA_IO_Buffers => {
-      crate::debug!(state.log, "SPA_IO_Buffers: port_id={}", port_id);
-      if !data.is_null() {
-        state.ports[port_id as usize].io = data.cast();
-      } else {
-        state.ports[port_id as usize].io = std::ptr::null_mut();
-      }
+      state.ports[port_id as usize].io = data.cast();
       0
     },
-    SPA_IO_RateMatch => 0,
+    SPA_IO_RateMatch => {
+      let rate_match = data as *mut spa_io_rate_match;
+      if !rate_match.is_null() {
+        assert_eq!(MAX_PORTS, 1); // the code assumes a single port
+        (*rate_match).flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+      }
+      state.rate_match = rate_match;
+      0
+    },
     _ => unimplemented!()
   }
 }
@@ -818,8 +844,9 @@ unsafe extern "C" fn init(
     data_system,
     log,
 
-    clock:    std::ptr::null_mut(),
-    position: std::ptr::null_mut(),
+    clock:      std::ptr::null_mut(),
+    position:   std::ptr::null_mut(),
+    rate_match: std::ptr::null_mut(),
 
     timer_source: spa_source {
       loop_: std::ptr::null_mut(),
@@ -851,6 +878,7 @@ unsafe extern "C" fn init(
         buffers:    vec![],
         io:         std::ptr::null_mut(),
         dsp:        crate::sound::DspReader::new(&dsp_path),
+        dll:        std::default::Default::default(),
         xrun_count: 0,
         starting:   false
       };
