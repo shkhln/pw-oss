@@ -24,7 +24,8 @@ struct State {
   ports:          [Port; MAX_PORTS],
   started:        bool,
   following:      bool,
-  active_buffers: usize
+  active_buffers: usize,
+  oss_delay:      u32 // additional delay in 1/8ths of period
 }
 
 impl State {
@@ -131,7 +132,10 @@ unsafe extern "C" fn sync(object: *mut c_void, seq: c_int) -> c_int {
   0
 }*/
 
-unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+unsafe extern "C" fn set_param(object: *mut c_void, id: u32, _flags: u32, param: *const spa_pod) -> c_int {
+
+  let state = object.cast::<State>().as_mut()
+    .expect("object is not supposed to be null");
 
   use libspa::pod::{Value, Object, Pod};
   use libspa::pod::deserialize::PodDeserializer;
@@ -154,7 +158,22 @@ unsafe extern "C" fn set_param(_object: *mut c_void, id: u32, _flags: u32, param
               SPA_PROP_monitorVolumes => (), // ditto
               SPA_PROP_softMute       => (), // ditto
               SPA_PROP_softVolumes    => (), // ditto
-              SPA_PROP_params         => (), // ditto
+              SPA_PROP_params         => {
+                match property.value {
+                  Value::Struct(values) if values.len() % 2 == 0 => {
+                    for kv in values.chunks(2) {
+                      match (&kv[0], &kv[1]) {
+                        // pw-cli set-param <object-id> Props '{ "params": ["oss.delay", 8]}'
+                        (Value::String(s), Value::Int(x)) if s == "oss.delay" && *x >= 0 => {
+                          state.oss_delay = *x as u32;
+                        },
+                        _ => ()
+                      }
+                    }
+                  }
+                  _ => ()
+                }
+              }
               _ => unimplemented!()
             }
           }
@@ -583,7 +602,7 @@ unsafe extern "C" fn process(object: *mut c_void) -> c_int {
     let driver_clock    = (*state.position).clock;
     let period_in_bytes = driver_clock.target_duration as u32 * port_config.stride();
 
-    let target_delay_in_bytes = period_in_bytes / 8 * 10; // ?
+    let target_delay_in_bytes = period_in_bytes / 8 * state.oss_delay;
 
     if !port.dsp.is_running() {
       assert!(port.starting);
@@ -888,7 +907,9 @@ unsafe extern "C" fn init(
     started:   false,
     following: false,
 
-    active_buffers: 0
+    active_buffers: 0,
+
+    oss_delay: 2
   });
 
   state.node_info.fix_pointers();
